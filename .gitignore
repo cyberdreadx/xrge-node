@@ -1,0 +1,19 @@
+# Rust build artifacts
+core/target/
+**/*.rs.bk
+
+# Environment
+.env
+.env.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Data
+*.jsonl
+*.sled/
