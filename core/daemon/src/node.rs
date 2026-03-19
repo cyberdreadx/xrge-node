@@ -1,28 +1,33 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::fs;
 
 use chrono::Utc;
 
 use quantum_vault_consensus::{compute_selection_seed, fetch_entropy, select_proposer, ProposerSelectionResult};
 use quantum_vault_crypto::{bytes_to_hex, pqc_keygen, pqc_sign, pqc_verify, sha256};
+use quantum_vault_storage::bridge_withdraw_store::BridgeWithdrawStore;
 use quantum_vault_storage::chain_store::ChainStore;
+use quantum_vault_storage::commitment_store::CommitmentStore;
+use quantum_vault_storage::mail_store::{MailLabel, MailMessage, MailStore};
 use quantum_vault_storage::messenger_store::{Conversation, MessengerMessage, MessengerStore, MessengerWallet};
+use quantum_vault_storage::name_registry::{NameEntry, NameRegistry};
+use quantum_vault_storage::nullifier_store::NullifierStore;
 use quantum_vault_storage::token_metadata_store::{TokenMetadata, TokenMetadataStore};
 use quantum_vault_storage::validator_store::{ValidatorState, ValidatorStore};
 use quantum_vault_types::{
-    compute_block_hash, compute_tx_hash, encode_header_v1, encode_tx_v1, BlockHeaderV1, BlockV1,
+    compute_block_hash, compute_tx_hash, encode_header_v1, encode_tx_v1, encode_tx_for_signing, BlockHeaderV1, BlockV1,
     ChainConfig, PQKeypair, SlashPayload, TxPayload, TxV1, VoteMessage,
 };
 
 use crate::amm;
+use crate::nft_store::{NftCollection, NftStore, NftToken};
 use crate::pool_store::{LiquidityPool, PoolStore};
 use crate::pool_events::{PoolEvent, PoolEventStore, PoolEventType, PriceSnapshot};
 
 const BASE_TRANSFER_FEE: f64 = 0.1;
 const TOKEN_CREATION_FEE: f64 = 100.0;
-const POOL_CREATION_FEE: f64 = 10.0;
-const SWAP_FEE: f64 = 0.1;
 const JAIL_BLOCKS: u64 = 20;
 const SLASH_DIVISOR: u128 = 10;
 const MAX_MEMPOOL: usize = 2000;
@@ -37,6 +42,8 @@ pub struct NodeOptions {
     pub data_dir: PathBuf,
     pub chain: ChainConfig,
     pub mine: bool,
+    /// Optional store for pending bridge withdrawals (qETH → ETH)
+    pub bridge_withdraw_store: Option<std::sync::Arc<BridgeWithdrawStore>>,
 }
 
 /// Key for token balances: (public_key, token_symbol)
@@ -52,26 +59,39 @@ pub struct L1Node {
     pool_store: PoolStore,
     pool_event_store: PoolEventStore,
     token_metadata_store: TokenMetadataStore,
+    nft_store: NftStore,
+    name_registry: NameRegistry,
+    mail_store: MailStore,
+    commitment_store: CommitmentStore,
+    nullifier_store: NullifierStore,
     keys: Arc<Mutex<PQKeypair>>,
     mempool: Arc<Mutex<HashMap<String, TxV1>>>,
+    verified_tx_ids: Arc<Mutex<HashSet<String>>>,
     balances: Arc<Mutex<HashMap<String, f64>>>,
     token_balances: Arc<Mutex<HashMap<TokenBalanceKey, f64>>>,
     lp_balances: Arc<Mutex<HashMap<TokenBalanceKey, f64>>>,  // LP token balances
     burned_tokens: Arc<Mutex<HashMap<String, f64>>>,  // Total burned per token symbol
     votes: Arc<Mutex<Vec<VoteMessage>>>,
     finalized_height: Arc<Mutex<u64>>,
+    /// Per-account nonce dedup: maps account pubkey to set of recently seen nonces
+    used_nonces: Arc<Mutex<HashMap<String, HashSet<u64>>>>,
 }
 
 impl L1Node {
     pub fn new(opts: NodeOptions) -> Result<Self, String> {
         let data_dir_str = opts.data_dir.to_string_lossy().to_string();
-        let store = ChainStore::new(&opts.data_dir, opts.chain.clone());
+        let store = ChainStore::new(&opts.data_dir, opts.chain.clone())?;
         let validator_store = ValidatorStore::new(&data_dir_str)?;
         let messenger_store = MessengerStore::new(&data_dir_str);
         let pool_store = PoolStore::new(&opts.data_dir)?;
         let pool_event_store = PoolEventStore::new(&opts.data_dir)?;
         let token_metadata_store = TokenMetadataStore::new(&data_dir_str)?;
-        let keys = pqc_keygen();
+        let nft_store = NftStore::new(&opts.data_dir)?;
+        let name_registry = NameRegistry::new(&opts.data_dir)?;
+        let mail_store = MailStore::new(&opts.data_dir)?;
+        let commitment_store = CommitmentStore::new(&opts.data_dir)?;
+        let nullifier_store = NullifierStore::new(&opts.data_dir)?;
+        let keys = Self::load_or_create_keys(&opts.data_dir)?;
         Ok(Self {
             node_id: uuid::Uuid::new_v4().to_string(),
             opts,
@@ -81,20 +101,51 @@ impl L1Node {
             pool_store,
             pool_event_store,
             token_metadata_store,
+            nft_store,
+            name_registry,
+            mail_store,
+            commitment_store,
+            nullifier_store,
             keys: Arc::new(Mutex::new(keys)),
             mempool: Arc::new(Mutex::new(HashMap::new())),
+            verified_tx_ids: Arc::new(Mutex::new(HashSet::new())),
             balances: Arc::new(Mutex::new(HashMap::new())),
             token_balances: Arc::new(Mutex::new(HashMap::new())),
             lp_balances: Arc::new(Mutex::new(HashMap::new())),
             burned_tokens: Arc::new(Mutex::new(HashMap::new())),
             votes: Arc::new(Mutex::new(Vec::new())),
             finalized_height: Arc::new(Mutex::new(0)),
+            used_nonces: Arc::new(Mutex::new(HashMap::new())),
         })
+    }
+
+    fn load_or_create_keys(data_dir: &PathBuf) -> Result<PQKeypair, String> {
+        let key_file = data_dir.join("node-keys.json");
+        if key_file.exists() {
+            let data = fs::read_to_string(&key_file)
+                .map_err(|e| format!("Failed to read node keys: {}", e))?;
+            let keys: PQKeypair = serde_json::from_str(&data)
+                .map_err(|e| format!("Failed to parse node keys: {}", e))?;
+            eprintln!("[node] Loaded persisted node keys (pub: {}...)", &keys.public_key_hex[..16.min(keys.public_key_hex.len())]);
+            Ok(keys)
+        } else {
+            let keys = pqc_keygen();
+            let data = serde_json::to_string_pretty(&keys)
+                .map_err(|e| format!("Failed to serialize node keys: {}", e))?;
+            fs::create_dir_all(data_dir)
+                .map_err(|e| format!("Failed to create data dir: {}", e))?;
+            fs::write(&key_file, &data)
+                .map_err(|e| format!("Failed to write node keys: {}", e))?;
+            eprintln!("[node] Generated and saved new node keys (pub: {}...)", &keys.public_key_hex[..16.min(keys.public_key_hex.len())]);
+            Ok(keys)
+        }
     }
 
     pub fn init(&self) -> Result<(), String> {
         self.store.init()?;
         self.messenger_store.init()?;
+        self.rebuild_pool_state()?;
+        self.rebuild_nft_state()?;
         self.rebuild_balances()?;
         self.rebuild_token_balances()?;
         let tip = self.store.get_tip()?;
@@ -135,6 +186,10 @@ impl L1Node {
         // Clear and replace the chain file
         self.store.reset_chain(blocks)?;
         
+        // Rebuild pool and NFT state from the new chain
+        self.rebuild_pool_state()?;
+        self.rebuild_nft_state()?;
+        
         // Reset balances
         let mut balances = self.balances.lock().map_err(|_| "balance lock")?;
         let mut token_balances = self.token_balances.lock().map_err(|_| "token balance lock")?;
@@ -149,7 +204,7 @@ impl L1Node {
         for block in blocks {
             // Apply transaction effects
             for tx in &block.txs {
-                Self::apply_balance_tx_inner(&mut balances, &mut token_balances, &mut burned_tokens, tx);
+                Self::apply_balance_tx_inner(&mut balances, &mut token_balances, &mut burned_tokens, tx, Some(&self.validator_store), "_rebuild_");
                 Self::apply_amm_balance_effects(
                     &mut balances,
                     &mut token_balances,
@@ -177,11 +232,10 @@ impl L1Node {
     }
 
     pub fn get_recent_blocks(&self, limit: usize) -> Result<Vec<BlockV1>, String> {
-        let blocks = self.store.get_all_blocks()?;
-        if limit == 0 || blocks.len() <= limit {
-            return Ok(blocks);
+        if limit == 0 {
+            return self.store.get_all_blocks();
         }
-        Ok(blocks[blocks.len() - limit..].to_vec())
+        self.store.get_recent_blocks(limit)
     }
 
     /// Import a block from a peer (for P2P sync)
@@ -201,17 +255,77 @@ impl L1Node {
             return Err("Block prev_hash doesn't match our tip".to_string());
         }
         
-        // TODO: Verify proposer signature
-        // TODO: Verify all transaction signatures
+        // Verify proposer signature and block hash integrity
+        {
+            let header_bytes = encode_header_v1(&block.header);
+            match pqc_verify(&block.header.proposer_pub_key, &header_bytes, &block.proposer_sig) {
+                Ok(true) => {}
+                Ok(false) => return Err("Invalid proposer signature on imported block".to_string()),
+                Err(e) => return Err(format!("Proposer sig verification error: {}", e)),
+            }
+            let expected_hash = compute_block_hash(&header_bytes, &block.proposer_sig);
+            if block.hash != expected_hash {
+                return Err("Block hash mismatch".to_string());
+            }
+            // Check proposer is a known validator (skip for early blocks during initial sync
+            // when the syncing node hasn't replayed stake transactions yet)
+            let validators = self.list_validators().unwrap_or_default();
+            if !validators.is_empty() {
+                let is_valid_proposer = validators.iter().any(|(pk, vs)| {
+                    pk == &block.header.proposer_pub_key && vs.stake > 0
+                });
+                if !is_valid_proposer {
+                    eprintln!(
+                        "[peer] Warning: block {} proposer {} not in validator set, accepting (sig valid)",
+                        block.header.height,
+                        &block.header.proposer_pub_key[..16.min(block.header.proposer_pub_key.len())]
+                    );
+                }
+            }
+        }
+
+        // Verify all transaction signatures in parallel
+        {
+            use rayon::prelude::*;
+            let invalid_count = block
+                .txs
+                .par_iter()
+                .filter(|tx| {
+                    // V2 transactions carry the original signed payload
+                    if let Some(ref sp) = tx.signed_payload {
+                        let bytes = sp.as_bytes();
+                        if pqc_verify(&tx.from_pub_key, bytes, &tx.sig).ok() == Some(true) {
+                            return false; // valid
+                        }
+                    }
+                    // V1 new format: encode without sig field
+                    let bytes_new = encode_tx_for_signing(tx);
+                    if pqc_verify(&tx.from_pub_key, &bytes_new, &tx.sig).ok() == Some(true) {
+                        return false; // valid
+                    }
+                    // V1 legacy format: encode full tx with sig cleared
+                    let mut legacy = (*tx).clone();
+                    legacy.sig = String::new();
+                    legacy.signed_payload = None;
+                    let bytes_legacy = encode_tx_v1(&legacy);
+                    if pqc_verify(&tx.from_pub_key, &bytes_legacy, &tx.sig).ok() == Some(true) {
+                        return false; // valid
+                    }
+                    eprintln!("[peer] Rejecting tx: all signature verification methods failed for {}", &tx.from_pub_key[..16.min(tx.from_pub_key.len())]);
+                    true
+                })
+                .count();
+            if invalid_count > 0 {
+                return Err(format!("Block has {} invalid tx signatures", invalid_count));
+            }
+        }
         
-        // Store the block
-        self.store.append_block(&block)?;
-        
-        // Apply transactions and distribute fees
+        // Apply state BEFORE storing to disk (atomic: don't store blocks we can't apply)
         self.apply_balance_block(&block)?;
-        
-        // Apply validator state changes
         self.apply_validator_block(&block)?;
+        
+        // Only persist after state was applied successfully
+        self.store.append_block(&block)?;
         
         eprintln!("[node] Imported block {} from peer", block.header.height);
         Ok(())
@@ -249,6 +363,28 @@ impl L1Node {
             }
         }
         Ok(result)
+    }
+
+    /// Get all native XRGE balances (from the main balances map, not token_balances)
+    pub fn get_all_native_balances(&self) -> Result<HashMap<String, f64>, String> {
+        let balances = self.balances.lock().map_err(|_| "balance lock")?;
+        Ok(balances.iter()
+            .filter(|(_, b)| **b > 0.0)
+            .map(|(k, v)| (k.clone(), *v))
+            .collect())
+    }
+
+    // Shielded transaction public API
+    pub fn is_nullifier_spent(&self, nullifier_hex: &str) -> Result<bool, String> {
+        self.nullifier_store.is_spent(nullifier_hex)
+    }
+
+    pub fn get_commitment_count(&self) -> usize {
+        self.commitment_store.count()
+    }
+
+    pub fn get_nullifier_count(&self) -> usize {
+        self.nullifier_store.count()
     }
 
     /// Find the original creator of a token by scanning blockchain history
@@ -345,6 +481,11 @@ impl L1Node {
                             .map(|s| s.to_uppercase() == symbol_upper)
                             .unwrap_or(false);
                         token_in_match || token_out_match
+                    }
+                    "bridge_mint" | "bridge_withdraw" => {
+                        tx.payload.token_symbol.as_ref()
+                            .map(|s| s.to_uppercase() == symbol_upper)
+                            .unwrap_or(false)
                     }
                     _ => false,
                 };
@@ -513,10 +654,6 @@ impl L1Node {
         self.pool_store.get_pool(pool_id)
     }
 
-    pub fn get_pool_by_tokens(&self, token_a: &str, token_b: &str) -> Result<Option<LiquidityPool>, String> {
-        self.pool_store.get_pool_by_tokens(token_a, token_b)
-    }
-
     pub fn list_pools(&self) -> Result<Vec<LiquidityPool>, String> {
         self.pool_store.list_pools()
     }
@@ -556,19 +693,29 @@ impl L1Node {
         use quantum_vault_crypto::{sha256, bytes_to_hex};
         use quantum_vault_types::encode_tx_v1;
         
+        self.check_nonce_replay(&tx.from_pub_key, tx.nonce)?;
+
         let tx_hash = bytes_to_hex(&sha256(&encode_tx_v1(&tx)));
         
         let mut mempool = self.mempool.lock().map_err(|_| "mempool lock")?;
         
-        // Skip if already in mempool
         if mempool.contains_key(&tx_hash) {
             return Ok(());
         }
         
-        // TODO: Verify signature before adding
+        // Mark as pre-verified (caller already checked the client-side signature)
+        self.verified_tx_ids.lock().map_err(|_| "verified lock")?.insert(tx_hash.clone());
         
         mempool.insert(tx_hash, tx);
         Ok(())
+    }
+
+    pub fn get_node_public_key(&self) -> String {
+        self.keys.lock().map(|k| k.public_key_hex.clone()).unwrap_or_default()
+    }
+
+    pub fn get_mempool_snapshot(&self) -> Vec<TxV1> {
+        self.mempool.lock().map(|m| m.values().cloned().collect()).unwrap_or_default()
     }
 
     pub fn submit_user_tx(
@@ -615,8 +762,9 @@ impl L1Node {
             },
             fee: tx_fee,
             sig: String::new(),
+            signed_payload: None,
         };
-        let bytes = encode_tx_v1(&tx);
+        let bytes = encode_tx_for_signing(&tx);
         tx.sig = pqc_sign(from_private_key, &bytes)?;
         let ok = pqc_verify(from_public_key, &bytes, &tx.sig)?;
         if !ok {
@@ -635,6 +783,12 @@ impl L1Node {
         total_supply: u64,
         decimals: u8,
     ) -> Result<(TxV1, String), String> {
+        const RESERVED_SYMBOLS: &[&str] = &["XRGE", "QETH", "QUSDC", "ETH", "USDC"];
+        let symbol_upper = token_symbol.to_uppercase();
+        if RESERVED_SYMBOLS.contains(&symbol_upper.as_str()) {
+            return Err(format!("'{}' is a reserved token symbol", token_symbol));
+        }
+
         let tx_fee = TOKEN_CREATION_FEE;
         
         // Check sender has sufficient balance for fee
@@ -664,8 +818,9 @@ impl L1Node {
             },
             fee: tx_fee,
             sig: String::new(),
+            signed_payload: None,
         };
-        let bytes = encode_tx_v1(&tx);
+        let bytes = encode_tx_for_signing(&tx);
         tx.sig = pqc_sign(from_private_key, &bytes)?;
         let ok = pqc_verify(from_public_key, &bytes, &tx.sig)?;
         if !ok {
@@ -694,8 +849,151 @@ impl L1Node {
             },
             fee: 0.0,
             sig: String::new(),
+            signed_payload: None,
         };
-        let bytes = encode_tx_v1(&tx);
+        let bytes = encode_tx_for_signing(&tx);
+        tx.sig = pqc_sign(&keys.secret_key_hex, &bytes)?;
+        self.accept_tx(tx.clone())?;
+        Ok(tx)
+    }
+
+    /// Submit a bridge_withdraw tx (user-signed): burn qETH and record withdrawal for operator to release ETH.
+    pub fn submit_bridge_withdraw_tx(
+        &self,
+        from_private_key: &str,
+        from_public_key: &str,
+        amount_units: u64,
+        evm_address: &str,
+        fee: Option<f64>,
+    ) -> Result<TxV1, String> {
+        let tx_fee = fee.unwrap_or(BASE_TRANSFER_FEE);
+        // Check XRGE for fee
+        let xrge_balance = self.get_balance(from_public_key)?;
+        if xrge_balance < tx_fee {
+            return Err(format!("Insufficient XRGE for fee: need {} XRGE", tx_fee));
+        }
+        // Check qETH balance
+        let qeth_balance = self.get_token_balance(from_public_key, "qETH")?;
+        if qeth_balance < amount_units as f64 {
+            return Err(format!(
+                "Insufficient qETH: have {}, need {}",
+                qeth_balance, amount_units
+            ));
+        }
+        // Validate EVM address (0x + 40 hex chars)
+        let evm = evm_address.trim().to_lowercase();
+        let evm = if evm.starts_with("0x") { evm } else { format!("0x{}", evm) };
+        if evm.len() != 42 || !evm[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("Invalid EVM address".to_string());
+        }
+        let mut tx = TxV1 {
+            version: 1,
+            tx_type: "bridge_withdraw".to_string(),
+            from_pub_key: from_public_key.to_string(),
+            nonce: Utc::now().timestamp_millis() as u64,
+            payload: TxPayload {
+                amount: Some(amount_units),
+                token_symbol: Some("qETH".to_string()),
+                evm_address: Some(evm),
+                ..Default::default()
+            },
+            fee: tx_fee,
+            sig: String::new(),
+            signed_payload: None,
+        };
+        let bytes = encode_tx_for_signing(&tx);
+        tx.sig = pqc_sign(from_private_key, &bytes)?;
+        let ok = pqc_verify(from_public_key, &bytes, &tx.sig)?;
+        if !ok {
+            return Err("invalid signature".to_string());
+        }
+        self.accept_tx(tx.clone())?;
+        Ok(tx)
+    }
+
+    /// Submit a bridge_withdraw tx without requiring a private key (pre-verified signature).
+    pub fn submit_bridge_withdraw_tx_signed(
+        &self,
+        from_public_key: &str,
+        amount_units: u64,
+        evm_address: &str,
+        fee: Option<f64>,
+        token_symbol: &str,
+    ) -> Result<TxV1, String> {
+        let tx_fee = fee.unwrap_or(BASE_TRANSFER_FEE);
+        let xrge_balance = self.get_balance(from_public_key)?;
+        if xrge_balance < tx_fee {
+            return Err(format!("Insufficient XRGE for fee: need {} XRGE", tx_fee));
+        }
+        let token_upper = token_symbol.to_uppercase();
+        if token_upper == "XRGE" {
+            if xrge_balance - tx_fee < amount_units as f64 {
+                return Err(format!(
+                    "Insufficient XRGE: have {}, need {}",
+                    xrge_balance - tx_fee, amount_units
+                ));
+            }
+        } else {
+            let token_balance = self.get_token_balance(from_public_key, &token_upper)?;
+            if token_balance < amount_units as f64 {
+                return Err(format!(
+                    "Insufficient {}: have {}, need {}",
+                    token_upper, token_balance, amount_units
+                ));
+            }
+        }
+        let evm = evm_address.trim().to_lowercase();
+        let evm = if evm.starts_with("0x") { evm } else { format!("0x{}", evm) };
+        if evm.len() != 42 || !evm[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("Invalid EVM address".to_string());
+        }
+        let keys = self.keys.lock().map_err(|_| "keys lock")?.clone();
+        let mut tx = TxV1 {
+            version: 1,
+            tx_type: "bridge_withdraw".to_string(),
+            from_pub_key: from_public_key.to_string(),
+            nonce: Utc::now().timestamp_millis() as u64,
+            payload: TxPayload {
+                amount: Some(amount_units),
+                token_symbol: Some(token_upper),
+                evm_address: Some(evm),
+                ..Default::default()
+            },
+            fee: tx_fee,
+            sig: String::new(),
+            signed_payload: None,
+        };
+        let bytes = encode_tx_for_signing(&tx);
+        tx.sig = pqc_sign(&keys.secret_key_hex, &bytes)?;
+        self.accept_tx(tx.clone())?;
+        Ok(tx)
+    }
+
+    /// Submit a bridge_mint tx (authority only): mint bridged token to recipient.
+    /// Used when verifying a deposit from Base Sepolia (or other EVM chain).
+    pub fn submit_bridge_mint_tx(
+        &self,
+        recipient_public_key: &str,
+        amount: u64,
+        token_symbol: &str,
+    ) -> Result<TxV1, String> {
+        let keys = self.keys.lock().map_err(|_| "keys lock")?.clone();
+        let mut tx = TxV1 {
+            version: 1,
+            tx_type: "bridge_mint".to_string(),
+            from_pub_key: keys.public_key_hex.clone(),
+            nonce: Utc::now().timestamp_millis() as u64,
+            payload: TxPayload {
+                to_pub_key_hex: Some(recipient_public_key.to_string()),
+                amount: Some(amount),
+                token_symbol: Some(token_symbol.to_string()),
+                ..Default::default()
+            },
+            fee: 0.0,
+            sig: String::new(),
+            signed_payload: None,
+        };
+        let bytes = encode_tx_for_signing(&tx);
         tx.sig = pqc_sign(&keys.secret_key_hex, &bytes)?;
         self.accept_tx(tx.clone())?;
         Ok(tx)
@@ -734,8 +1032,9 @@ impl L1Node {
             },
             fee: tx_fee,
             sig: String::new(),
+            signed_payload: None,
         };
-        let bytes = encode_tx_v1(&tx);
+        let bytes = encode_tx_for_signing(&tx);
         tx.sig = pqc_sign(from_private_key, &bytes)?;
         let ok = pqc_verify(from_public_key, &bytes, &tx.sig)?;
         if !ok {
@@ -766,8 +1065,9 @@ impl L1Node {
             },
             fee: fee.unwrap_or(BASE_TRANSFER_FEE),
             sig: String::new(),
+            signed_payload: None,
         };
-        let bytes = encode_tx_v1(&tx);
+        let bytes = encode_tx_for_signing(&tx);
         tx.sig = pqc_sign(from_private_key, &bytes)?;
         let ok = pqc_verify(from_public_key, &bytes, &tx.sig)?;
         if !ok {
@@ -875,12 +1175,14 @@ impl L1Node {
     }
 
     pub fn get_fee_stats(&self) -> Result<(f64, f64), String> {
+        let tip = self.store.get_tip()?;
+        let last_fees = if let Some(last_block) = self.store.get_block(tip.height)? {
+            last_block.txs.iter().map(|tx| tx.fee).sum::<f64>()
+        } else {
+            0.0
+        };
         let blocks = self.store.get_all_blocks()?;
-        let total_fees = blocks.iter().map(|b| b.txs.iter().map(|tx| tx.fee).sum::<f64>()).sum();
-        let last_fees = blocks
-            .last()
-            .map(|b| b.txs.iter().map(|tx| tx.fee).sum::<f64>())
-            .unwrap_or(0.0);
+        let total_fees: f64 = blocks.iter().map(|b| b.txs.iter().map(|tx| tx.fee).sum::<f64>()).sum();
         Ok((total_fees, last_fees))
     }
 
@@ -889,8 +1191,28 @@ impl L1Node {
         if mempool.is_empty() {
             return Ok(None);
         }
-        let txs: Vec<TxV1> = mempool.values().cloned().collect();
-        mempool.clear();
+        let tx_entries: Vec<(String, TxV1)> = mempool.drain().collect();
+        drop(mempool);
+        let mut verified_set = self.verified_tx_ids.lock().map_err(|_| "verified lock")?;
+        // Verify signatures in parallel; skip re-verification for pre-verified (v2 API) txs
+        let txs: Vec<TxV1> = {
+            use rayon::prelude::*;
+            tx_entries.into_par_iter()
+                .filter(|(id, tx)| {
+                    if verified_set.contains(id) {
+                        return true;
+                    }
+                    let bytes = encode_tx_for_signing(tx);
+                    pqc_verify(&tx.from_pub_key, &bytes, &tx.sig).ok() == Some(true)
+                })
+                .map(|(_, tx)| tx)
+                .collect()
+        };
+        verified_set.clear();
+        drop(verified_set);
+        if txs.is_empty() {
+            return Ok(None);
+        }
         let tip = self.store.get_tip()?;
         let header = BlockHeaderV1 {
             version: 1,
@@ -918,7 +1240,27 @@ impl L1Node {
         Ok(Some(block))
     }
 
+    fn check_nonce_replay(&self, from_pub_key: &str, nonce: u64) -> Result<(), String> {
+        let mut nonces = self.used_nonces.lock().map_err(|_| "nonce lock")?;
+        let account_nonces = nonces.entry(from_pub_key.to_string()).or_default();
+
+        if account_nonces.contains(&nonce) {
+            return Err("Duplicate nonce — possible replay".to_string());
+        }
+
+        account_nonces.insert(nonce);
+
+        // Prune old nonces to prevent unbounded growth (keep last 1000)
+        if account_nonces.len() > 1000 {
+            let min_nonce = *account_nonces.iter().min().unwrap();
+            account_nonces.remove(&min_nonce);
+        }
+
+        Ok(())
+    }
+
     fn accept_tx(&self, tx: TxV1) -> Result<(), String> {
+        self.check_nonce_replay(&tx.from_pub_key, tx.nonce)?;
         let id = bytes_to_hex(&sha256(&encode_tx_v1(&tx)));
         let mut mempool = self.mempool.lock().map_err(|_| "mempool lock")?;
         if mempool.len() >= MAX_MEMPOOL {
@@ -940,11 +1282,20 @@ impl L1Node {
         let mut lp_balances = self.lp_balances.lock().map_err(|_| "lp balance lock")?;
         let mut burned_tokens = self.burned_tokens.lock().map_err(|_| "burned tokens lock")?;
         
+        // Track actual fees collected (not all tx fees -- rejected txs don't pay)
+        let mut actual_fees_collected = 0.0_f64;
+
+        let node_pub_key = self.keys.lock().map(|k| k.public_key_hex.clone()).unwrap_or_default();
         // Apply transaction effects (transfers, stakes, etc.) - fees deducted from senders
         for tx in &block.txs {
-            Self::apply_balance_tx_inner(&mut balances, &mut token_balances, &mut burned_tokens, tx);
+            let before = balances.values().sum::<f64>();
+            Self::apply_balance_tx_inner(&mut balances, &mut token_balances, &mut burned_tokens, tx, Some(&self.validator_store), &node_pub_key);
+            let after = balances.values().sum::<f64>();
+            let deducted = before - after;
+            if deducted > 0.0 { actual_fees_collected += tx.fee.min(deducted); }
             
             // Handle AMM transactions
+            let before_amm = balances.values().sum::<f64>();
             self.apply_amm_tx_inner(
                 &mut balances,
                 &mut token_balances,
@@ -953,14 +1304,45 @@ impl L1Node {
                 block.header.time,
                 block.header.height,
             )?;
+            let after_amm = balances.values().sum::<f64>();
+            let deducted_amm = before_amm - after_amm;
+            if deducted_amm > 0.0 { actual_fees_collected += tx.fee.min(deducted_amm); }
+
+            // Handle NFT transactions
+            let before_nft = balances.values().sum::<f64>();
+            self.apply_nft_tx_inner(
+                &mut balances,
+                tx,
+                block.header.time,
+            )?;
+            let after_nft = balances.values().sum::<f64>();
+            let deducted_nft = before_nft - after_nft;
+            if deducted_nft > 0.0 { actual_fees_collected += tx.fee.min(deducted_nft); }
         }
         
-        // Distribute fees: 25% to proposer, 75% split by stake
-        let total_fees: f64 = block.txs.iter().map(|tx| tx.fee).sum();
-        if total_fees > 0.0 {
+        // Persist bridge_withdraw txs for operator to fulfill releases
+        if let Some(ref store) = self.opts.bridge_withdraw_store {
+            for tx in &block.txs {
+                if tx.tx_type == "bridge_withdraw"
+                    && tx.payload.amount.unwrap_or(0) > 0
+                {
+                    if let Some(evm_addr) = tx.payload.evm_address.as_ref() {
+                        let token = tx.payload.token_symbol.as_deref().unwrap_or("qETH");
+                        let prefix = if token == "XRGE" { "xrge:" } else { "" };
+                        let raw_id = bytes_to_hex(&sha256(&encode_tx_v1(tx)));
+                        let tx_id = format!("{}{}", prefix, raw_id);
+                        let amount = tx.payload.amount.unwrap_or(0);
+                        let _ = store.add(tx_id.clone(), evm_addr.clone(), amount);
+                    }
+                }
+            }
+        }
+        
+        // Distribute only actually collected fees
+        if actual_fees_collected > 0.0 {
             Self::distribute_fees(
                 &mut balances,
-                total_fees,
+                actual_fees_collected,
                 &block.header.proposer_pub_key,
                 &self.get_validator_stakes_snapshot()?,
             );
@@ -987,6 +1369,32 @@ impl L1Node {
                 let token_b = tx.payload.token_b_symbol.as_ref().ok_or("missing token_b")?;
                 let amount_a = tx.payload.amount_a.ok_or("missing amount_a")?;
                 let amount_b = tx.payload.amount_b.ok_or("missing amount_b")?;
+
+                // Balance guard
+                let mut xrge_needed = tx.fee;
+                if token_a == "XRGE" { xrge_needed += amount_a as f64; }
+                if token_b == "XRGE" { xrge_needed += amount_b as f64; }
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < xrge_needed {
+                    eprintln!("[node] Rejecting create_pool: insufficient XRGE ({:.4} < {:.4})", xrge_bal, xrge_needed);
+                    return Ok(());
+                }
+                if token_a != "XRGE" {
+                    let key = (tx.from_pub_key.clone(), token_a.clone());
+                    let bal = *token_balances.get(&key).unwrap_or(&0.0);
+                    if bal < amount_a as f64 {
+                        eprintln!("[node] Rejecting create_pool: insufficient {} ({:.4} < {})", token_a, bal, amount_a);
+                        return Ok(());
+                    }
+                }
+                if token_b != "XRGE" {
+                    let key = (tx.from_pub_key.clone(), token_b.clone());
+                    let bal = *token_balances.get(&key).unwrap_or(&0.0);
+                    if bal < amount_b as f64 {
+                        eprintln!("[node] Rejecting create_pool: insufficient {} ({:.4} < {})", token_b, bal, amount_b);
+                        return Ok(());
+                    }
+                }
                 
                 // Deduct XRGE fee
                 *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
@@ -1062,8 +1470,39 @@ impl L1Node {
                 let amount_a = tx.payload.amount_a.ok_or("missing amount_a")?;
                 let amount_b = tx.payload.amount_b.ok_or("missing amount_b")?;
                 
-                let mut pool = self.pool_store.get_pool(pool_id)?
-                    .ok_or_else(|| format!("Pool not found: {}", pool_id))?;
+                let mut pool = match self.pool_store.get_pool(pool_id)? {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[node] Warning: Pool {} not found, skipping add_liquidity", pool_id);
+                        return Ok(());
+                    }
+                };
+
+                // Balance guard
+                let mut xrge_needed = tx.fee;
+                if pool.token_a == "XRGE" { xrge_needed += amount_a as f64; }
+                if pool.token_b == "XRGE" { xrge_needed += amount_b as f64; }
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < xrge_needed {
+                    eprintln!("[node] Rejecting add_liquidity: insufficient XRGE ({:.4} < {:.4})", xrge_bal, xrge_needed);
+                    return Ok(());
+                }
+                if pool.token_a != "XRGE" {
+                    let key = (tx.from_pub_key.clone(), pool.token_a.clone());
+                    let bal = *token_balances.get(&key).unwrap_or(&0.0);
+                    if bal < amount_a as f64 {
+                        eprintln!("[node] Rejecting add_liquidity: insufficient {} ({:.4} < {})", pool.token_a, bal, amount_a);
+                        return Ok(());
+                    }
+                }
+                if pool.token_b != "XRGE" {
+                    let key = (tx.from_pub_key.clone(), pool.token_b.clone());
+                    let bal = *token_balances.get(&key).unwrap_or(&0.0);
+                    if bal < amount_b as f64 {
+                        eprintln!("[node] Rejecting add_liquidity: insufficient {} ({:.4} < {})", pool.token_b, bal, amount_b);
+                        return Ok(());
+                    }
+                }
                 
                 // Deduct fee
                 *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
@@ -1141,8 +1580,26 @@ impl L1Node {
                 let pool_id = tx.payload.pool_id.as_ref().ok_or("missing pool_id")?;
                 let lp_amount = tx.payload.lp_amount.ok_or("missing lp_amount")?;
                 
-                let mut pool = self.pool_store.get_pool(pool_id)?
-                    .ok_or_else(|| format!("Pool not found: {}", pool_id))?;
+                let mut pool = match self.pool_store.get_pool(pool_id)? {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[node] Warning: Pool {} not found, skipping remove_liquidity", pool_id);
+                        return Ok(());
+                    }
+                };
+
+                // Balance guard: check XRGE for fee and LP token balance
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < tx.fee {
+                    eprintln!("[node] Rejecting remove_liquidity: insufficient XRGE for fee ({:.4} < {:.4})", xrge_bal, tx.fee);
+                    return Ok(());
+                }
+                let lp_key = (tx.from_pub_key.clone(), pool_id.clone());
+                let lp_bal = *lp_balances.get(&lp_key).unwrap_or(&0.0);
+                if lp_bal < lp_amount as f64 {
+                    eprintln!("[node] Rejecting remove_liquidity: insufficient LP tokens ({:.4} < {})", lp_bal, lp_amount);
+                    return Ok(());
+                }
                 
                 // Deduct fee
                 *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
@@ -1220,6 +1677,26 @@ impl L1Node {
                 let token_out = tx.payload.token_b_symbol.as_ref().ok_or("missing token_b_symbol (token_out)")?;
                 let amount_in = tx.payload.amount_a.ok_or("missing amount_a (amount_in)")?;
                 let min_amount_out = tx.payload.min_amount_out.unwrap_or(0);
+
+                // Balance guard: reject swap if user cannot afford it
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if token_in == "XRGE" {
+                    if xrge_bal < amount_in as f64 + tx.fee {
+                        eprintln!("[node] Rejecting swap: insufficient XRGE balance ({:.4} < {:.4})", xrge_bal, amount_in as f64 + tx.fee);
+                        return Ok(());
+                    }
+                } else {
+                    if xrge_bal < tx.fee {
+                        eprintln!("[node] Rejecting swap: insufficient XRGE for fee ({:.4} < {:.4})", xrge_bal, tx.fee);
+                        return Ok(());
+                    }
+                    let token_key = (tx.from_pub_key.clone(), token_in.clone());
+                    let token_bal = *token_balances.get(&token_key).unwrap_or(&0.0);
+                    if token_bal < amount_in as f64 {
+                        eprintln!("[node] Rejecting swap: insufficient {} balance ({:.4} < {})", token_in, token_bal, amount_in);
+                        return Ok(());
+                    }
+                }
                 
                 // Deduct fee
                 *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
@@ -1229,19 +1706,38 @@ impl L1Node {
                 
                 // Execute swap through the path
                 let mut current_amount = amount_in;
+                let mut swap_ok = true;
                 for i in 0..(path.len() - 1) {
                     let t_in = &path[i];
                     let t_out = &path[i + 1];
                     
                     let pool_id = LiquidityPool::make_pool_id(t_in, t_out);
-                    let mut pool = self.pool_store.get_pool(&pool_id)?
-                        .ok_or_else(|| format!("Pool not found: {}", pool_id))?;
+                    let mut pool = match self.pool_store.get_pool(&pool_id)? {
+                        Some(p) => p,
+                        None => {
+                            eprintln!("[node] Warning: Pool {} not found, skipping swap", pool_id);
+                            swap_ok = false;
+                            break;
+                        }
+                    };
                     
-                    let (reserve_in, reserve_out) = pool.get_reserves(t_in)
-                        .ok_or("Invalid token for pool")?;
+                    let (reserve_in, reserve_out) = match pool.get_reserves(t_in) {
+                        Some(r) => r,
+                        None => {
+                            eprintln!("[node] Warning: Invalid token for pool {}, skipping swap", pool_id);
+                            swap_ok = false;
+                            break;
+                        }
+                    };
                     
-                    let amount_out = amm::get_amount_out(current_amount, reserve_in, reserve_out)
-                        .ok_or("Insufficient liquidity")?;
+                    let amount_out = match amm::get_amount_out(current_amount, reserve_in, reserve_out) {
+                        Some(a) => a,
+                        None => {
+                            eprintln!("[node] Warning: Insufficient liquidity in {}, skipping swap", pool_id);
+                            swap_ok = false;
+                            break;
+                        }
+                    };
                     
                     // Deduct input token (only on first hop)
                     if i == 0 {
@@ -1266,9 +1762,14 @@ impl L1Node {
                     current_amount = amount_out;
                 }
                 
-                // Check slippage
+                if !swap_ok {
+                    return Ok(());
+                }
+                
+                // Enforce slippage protection
                 if current_amount < min_amount_out {
-                    return Err(format!("Slippage exceeded: got {} but minimum was {}", current_amount, min_amount_out));
+                    eprintln!("[node] Rejecting swap: slippage exceeded (got {} < min {})", current_amount, min_amount_out);
+                    return Ok(());
                 }
                 
                 // Credit output token
@@ -1328,12 +1829,12 @@ impl L1Node {
         let mut balances = self.balances.lock().map_err(|_| "balance lock")?;
         let mut token_balances = self.token_balances.lock().map_err(|_| "token balance lock")?;
         let mut burned_tokens = self.burned_tokens.lock().map_err(|_| "burned tokens lock")?;
-        Self::apply_balance_tx_inner(&mut balances, &mut token_balances, &mut burned_tokens, tx);
+        let node_pub_key = self.keys.lock().map(|k| k.public_key_hex.clone()).unwrap_or_default();
+        Self::apply_balance_tx_inner(&mut balances, &mut token_balances, &mut burned_tokens, tx, Some(&self.validator_store), &node_pub_key);
         Ok(())
     }
 
     fn rebuild_balances(&self) -> Result<(), String> {
-        // Collect all blocks first, then process them
         let blocks = self.store.get_all_blocks()?;
         let mut balances = self.balances.lock().map_err(|_| "balance lock")?;
         let mut token_balances = self.token_balances.lock().map_err(|_| "token balance lock")?;
@@ -1344,12 +1845,16 @@ impl L1Node {
         lp_balances.clear();
         burned_tokens.clear();
         
+        let mut skipped_txs = 0u64;
+
         for block in &blocks {
-            // Apply transaction effects
+            let mut actual_fees_collected: f64 = 0.0;
+
             for tx in &block.txs {
-                Self::apply_balance_tx_inner(&mut balances, &mut token_balances, &mut burned_tokens, tx);
+                let sum_before: f64 = balances.values().sum();
+
+                Self::apply_balance_tx_inner(&mut balances, &mut token_balances, &mut burned_tokens, tx, Some(&self.validator_store), "_rebuild_");
                 
-                // Apply AMM transaction balance effects (but don't update pool_store - already persisted)
                 Self::apply_amm_balance_effects(
                     &mut balances,
                     &mut token_balances,
@@ -1357,20 +1862,34 @@ impl L1Node {
                     tx,
                     &self.pool_store,
                 );
+
+                Self::apply_nft_balance_effects(&mut balances, tx);
+
+                // Apply shielded state effects (commitment/nullifier stores)
+                self.apply_shielded_state_effects(tx);
+
+                let sum_after: f64 = balances.values().sum();
+                let fee_delta = sum_before - sum_after;
+                if fee_delta > 0.0 {
+                    actual_fees_collected += fee_delta;
+                } else if fee_delta == 0.0 && tx.fee > 0.0 {
+                    skipped_txs += 1;
+                }
             }
             
-            // Distribute fees for this block
-            let total_fees: f64 = block.txs.iter().map(|tx| tx.fee).sum();
-            if total_fees > 0.0 {
-                // Get validator stakes at this block height for accurate distribution
+            if actual_fees_collected > 0.0 {
                 let stakes = self.get_validator_stakes_at_height(block.header.height)?;
                 Self::distribute_fees(
                     &mut balances,
-                    total_fees,
+                    actual_fees_collected,
                     &block.header.proposer_pub_key,
                     &stakes,
                 );
             }
+        }
+
+        if skipped_txs > 0 {
+            eprintln!("[rebuild] Skipped {} invalid transactions during balance rebuild", skipped_txs);
         }
         Ok(())
     }
@@ -1391,10 +1910,27 @@ impl L1Node {
                     tx.payload.amount_a,
                     tx.payload.amount_b,
                 ) {
-                    // Deduct fee
+                    // Balance guard
+                    let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                    let mut xrge_needed = tx.fee;
+                    if token_a == "XRGE" { xrge_needed += amount_a as f64; }
+                    if token_b == "XRGE" { xrge_needed += amount_b as f64; }
+                    if xrge_bal < xrge_needed {
+                        eprintln!("[rebuild] Skipping create_pool: insufficient XRGE ({:.4} < {:.4})", xrge_bal, xrge_needed);
+                        return;
+                    }
+                    if token_a != "XRGE" {
+                        let key = (tx.from_pub_key.clone(), token_a.clone());
+                        let bal = *token_balances.get(&key).unwrap_or(&0.0);
+                        if bal < amount_a as f64 { return; }
+                    }
+                    if token_b != "XRGE" {
+                        let key = (tx.from_pub_key.clone(), token_b.clone());
+                        let bal = *token_balances.get(&key).unwrap_or(&0.0);
+                        if bal < amount_b as f64 { return; }
+                    }
+
                     *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
-                    
-                    // Deduct tokens
                     if token_a == "XRGE" {
                         *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= amount_a as f64;
                     } else {
@@ -1408,10 +1944,8 @@ impl L1Node {
                         *token_balances.entry(key).or_insert(0.0) -= amount_b as f64;
                     }
                     
-                    // Get pool to find LP amount
                     let pool_id = LiquidityPool::make_pool_id(token_a, token_b);
                     if let Ok(Some(_pool)) = pool_store.get_pool(&pool_id) {
-                        // Initial LP (approximate - pool already has current state)
                         let initial_lp = ((amount_a as f64 * amount_b as f64).sqrt() as u64).saturating_sub(1000);
                         let lp_key = (tx.from_pub_key.clone(), pool_id);
                         *lp_balances.entry(lp_key).or_insert(0.0) += initial_lp as f64;
@@ -1424,9 +1958,23 @@ impl L1Node {
                     tx.payload.amount_a,
                     tx.payload.amount_b,
                 ) {
-                    *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
-                    
                     if let Ok(Some(pool)) = pool_store.get_pool(pool_id) {
+                        // Balance guard
+                        let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                        let mut xrge_needed = tx.fee;
+                        if pool.token_a == "XRGE" { xrge_needed += amount_a as f64; }
+                        if pool.token_b == "XRGE" { xrge_needed += amount_b as f64; }
+                        if xrge_bal < xrge_needed { return; }
+                        if pool.token_a != "XRGE" {
+                            let key = (tx.from_pub_key.clone(), pool.token_a.clone());
+                            if *token_balances.get(&key).unwrap_or(&0.0) < amount_a as f64 { return; }
+                        }
+                        if pool.token_b != "XRGE" {
+                            let key = (tx.from_pub_key.clone(), pool.token_b.clone());
+                            if *token_balances.get(&key).unwrap_or(&0.0) < amount_b as f64 { return; }
+                        }
+
+                        *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
                         if pool.token_a == "XRGE" {
                             *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= amount_a as f64;
                         } else {
@@ -1440,7 +1988,6 @@ impl L1Node {
                             *token_balances.entry(key).or_insert(0.0) -= amount_b as f64;
                         }
                         
-                        // LP calculation would need historical reserve data - simplified here
                         if let Some(lp_amount) = amm::calculate_lp_mint(amount_a, amount_b, pool.reserve_a, pool.reserve_b, pool.total_lp_supply) {
                             let lp_key = (tx.from_pub_key.clone(), pool_id.clone());
                             *lp_balances.entry(lp_key).or_insert(0.0) += lp_amount as f64;
@@ -1453,14 +2000,18 @@ impl L1Node {
                     tx.payload.pool_id.as_ref(),
                     tx.payload.lp_amount,
                 ) {
+                    // Balance guard: check fee + LP tokens
+                    let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                    if xrge_bal < tx.fee { return; }
+                    let lp_key = (tx.from_pub_key.clone(), pool_id.clone());
+                    let lp_bal = *lp_balances.get(&lp_key).unwrap_or(&0.0);
+                    if lp_bal < lp_amount as f64 { return; }
+
                     *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
                     
                     if let Ok(Some(pool)) = pool_store.get_pool(pool_id) {
-                        // Burn LP
-                        let lp_key = (tx.from_pub_key.clone(), pool_id.clone());
                         *lp_balances.entry(lp_key).or_insert(0.0) -= lp_amount as f64;
                         
-                        // Return tokens (simplified - uses current reserves)
                         if let Some((amount_a, amount_b)) = amm::calculate_remove_liquidity(lp_amount, pool.reserve_a, pool.reserve_b, pool.total_lp_supply) {
                             if pool.token_a == "XRGE" {
                                 *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) += amount_a as f64;
@@ -1484,11 +2035,27 @@ impl L1Node {
                     tx.payload.token_b_symbol.as_ref(),
                     tx.payload.amount_a,
                 ) {
+                    // Balance guard
+                    let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                    if token_in == "XRGE" {
+                        if xrge_bal < amount_in as f64 + tx.fee {
+                            eprintln!("[rebuild] Skipping swap: insufficient XRGE ({:.4} < {:.4})", xrge_bal, amount_in as f64 + tx.fee);
+                            return;
+                        }
+                    } else {
+                        if xrge_bal < tx.fee { return; }
+                        let key = (tx.from_pub_key.clone(), token_in.clone());
+                        let tok_bal = *token_balances.get(&key).unwrap_or(&0.0);
+                        if tok_bal < amount_in as f64 {
+                            eprintln!("[rebuild] Skipping swap: insufficient {} ({:.4} < {})", token_in, tok_bal, amount_in);
+                            return;
+                        }
+                    }
+
                     *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
                     
                     let path = tx.payload.swap_path.clone().unwrap_or_else(|| vec![token_in.clone(), token_out.clone()]);
                     
-                    // Deduct input
                     if token_in == "XRGE" {
                         *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= amount_in as f64;
                     } else {
@@ -1496,7 +2063,6 @@ impl L1Node {
                         *token_balances.entry(key).or_insert(0.0) -= amount_in as f64;
                     }
                     
-                    // Calculate output through path
                     let mut current_amount = amount_in;
                     for i in 0..(path.len() - 1) {
                         let t_in = &path[i];
@@ -1512,7 +2078,6 @@ impl L1Node {
                         }
                     }
                     
-                    // Credit output
                     let final_token = path.last().unwrap_or(token_out);
                     if final_token == "XRGE" {
                         *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) += current_amount as f64;
@@ -1526,9 +2091,190 @@ impl L1Node {
         }
     }
     
+    /// Deduct NFT fees during balance rebuild (NFT state is rebuilt separately in rebuild_nft_state)
+    fn apply_nft_balance_effects(
+        balances: &mut HashMap<String, f64>,
+        tx: &TxV1,
+    ) {
+        match tx.tx_type.as_str() {
+            "nft_create_collection" | "nft_mint" | "nft_batch_mint"
+            | "nft_burn" | "nft_lock" | "nft_freeze_collection" => {
+                let bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if bal < tx.fee { return; }
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+            }
+            "nft_transfer" => {
+                let bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if bal < tx.fee { return; }
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+            }
+            _ => {}
+        }
+    }
+
+    /// Apply shielded transaction state effects (commitment/nullifier stores).
+    /// Called during block processing and balance rebuild.
+    fn apply_shielded_state_effects(&self, tx: &TxV1) {
+        match tx.tx_type.as_str() {
+            "shield" => {
+                // Insert the new commitment into the commitment store
+                if let Some(commitment) = tx.payload.shielded_commitment.as_ref() {
+                    if let Err(e) = self.commitment_store.insert(commitment) {
+                        eprintln!("[node] Failed to insert shield commitment: {}", e);
+                    }
+                }
+            }
+            "shielded_transfer" => {
+                // 1. Mark nullifiers as spent (double-spend prevention)
+                if let Some(nullifiers) = tx.payload.shielded_nullifiers.as_ref() {
+                    for nullifier in nullifiers {
+                        if let Err(e) = self.nullifier_store.mark_spent(nullifier) {
+                            eprintln!("[node] Shielded transfer nullifier error: {}", e);
+                            return;
+                        }
+                    }
+                }
+                // 2. Insert new output commitments
+                if let Some(commitments) = tx.payload.shielded_output_commitments.as_ref() {
+                    for commitment in commitments {
+                        if let Err(e) = self.commitment_store.insert(commitment) {
+                            eprintln!("[node] Failed to insert output commitment: {}", e);
+                        }
+                    }
+                }
+            }
+            "unshield" => {
+                // Mark the spent note's nullifier
+                if let Some(nullifiers) = tx.payload.shielded_nullifiers.as_ref() {
+                    for nullifier in nullifiers {
+                        if let Err(e) = self.nullifier_store.mark_spent(nullifier) {
+                            eprintln!("[node] Unshield nullifier error: {}", e);
+                            return;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn rebuild_token_balances(&self) -> Result<(), String> {
         // Token balances are rebuilt as part of rebuild_balances
         // This is a separate call for clarity but the work is done in rebuild_balances
+        Ok(())
+    }
+
+    /// Rebuild pool state from chain history.
+    /// Clears pool_store and replays all pool-related transactions from genesis
+    /// to reconstruct correct pool reserves, LP supply, and pool existence.
+    fn rebuild_pool_state(&self) -> Result<(), String> {
+        let blocks = self.store.get_all_blocks()?;
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        self.pool_store.clear_all()?;
+
+        let mut pool_count = 0u32;
+        for block in &blocks {
+            for tx in &block.txs {
+                match tx.tx_type.as_str() {
+                    "create_pool" => {
+                        if let (Some(token_a), Some(token_b), Some(amount_a), Some(amount_b)) = (
+                            tx.payload.token_a_symbol.as_ref(),
+                            tx.payload.token_b_symbol.as_ref(),
+                            tx.payload.amount_a,
+                            tx.payload.amount_b,
+                        ) {
+                            let pool = LiquidityPool::new(
+                                token_a.clone(),
+                                token_b.clone(),
+                                amount_a,
+                                amount_b,
+                                tx.from_pub_key.clone(),
+                                block.header.time,
+                            );
+                            self.pool_store.save_pool(&pool)?;
+                            pool_count += 1;
+                        }
+                    }
+                    "add_liquidity" => {
+                        if let (Some(pool_id), Some(amount_a), Some(amount_b)) = (
+                            tx.payload.pool_id.as_ref(),
+                            tx.payload.amount_a,
+                            tx.payload.amount_b,
+                        ) {
+                            if let Some(mut pool) = self.pool_store.get_pool(pool_id)? {
+                                let lp_amount = amm::calculate_lp_mint(
+                                    amount_a, amount_b,
+                                    pool.reserve_a, pool.reserve_b,
+                                    pool.total_lp_supply,
+                                ).unwrap_or(0);
+                                pool.reserve_a += amount_a;
+                                pool.reserve_b += amount_b;
+                                pool.total_lp_supply += lp_amount;
+                                self.pool_store.save_pool(&pool)?;
+                            }
+                        }
+                    }
+                    "remove_liquidity" => {
+                        if let (Some(pool_id), Some(lp_amount)) = (
+                            tx.payload.pool_id.as_ref(),
+                            tx.payload.lp_amount,
+                        ) {
+                            if let Some(mut pool) = self.pool_store.get_pool(pool_id)? {
+                                if let Some((amount_a, amount_b)) = amm::calculate_remove_liquidity(
+                                    lp_amount, pool.reserve_a, pool.reserve_b, pool.total_lp_supply,
+                                ) {
+                                    pool.reserve_a = pool.reserve_a.saturating_sub(amount_a);
+                                    pool.reserve_b = pool.reserve_b.saturating_sub(amount_b);
+                                    pool.total_lp_supply = pool.total_lp_supply.saturating_sub(lp_amount);
+                                    self.pool_store.save_pool(&pool)?;
+                                }
+                            }
+                        }
+                    }
+                    "swap" => {
+                        if let (Some(token_in), Some(token_out), Some(amount_in)) = (
+                            tx.payload.token_a_symbol.as_ref(),
+                            tx.payload.token_b_symbol.as_ref(),
+                            tx.payload.amount_a,
+                        ) {
+                            let path = tx.payload.swap_path.clone()
+                                .unwrap_or_else(|| vec![token_in.clone(), token_out.clone()]);
+
+                            let mut current_amount = amount_in;
+                            for i in 0..(path.len() - 1) {
+                                let t_in = &path[i];
+                                let t_out = &path[i + 1];
+                                let pool_id = LiquidityPool::make_pool_id(t_in, t_out);
+
+                                if let Some(mut pool) = self.pool_store.get_pool(&pool_id)? {
+                                    if let Some((reserve_in, reserve_out)) = pool.get_reserves(t_in) {
+                                        if let Some(amount_out) = amm::get_amount_out(current_amount, reserve_in, reserve_out) {
+                                            if pool.token_a == *t_in {
+                                                pool.reserve_a += current_amount;
+                                                pool.reserve_b = pool.reserve_b.saturating_sub(amount_out);
+                                            } else {
+                                                pool.reserve_b += current_amount;
+                                                pool.reserve_a = pool.reserve_a.saturating_sub(amount_out);
+                                            }
+                                            self.pool_store.save_pool(&pool)?;
+                                            current_amount = amount_out;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if pool_count > 0 {
+            eprintln!("[node] Rebuilt {} pools from chain history", pool_count);
+        }
         Ok(())
     }
     
@@ -1564,63 +2310,196 @@ impl L1Node {
         token_balances: &mut HashMap<TokenBalanceKey, f64>,
         burned_tokens: &mut HashMap<String, f64>,
         tx: &TxV1,
+        validator_store: Option<&quantum_vault_storage::validator_store::ValidatorStore>,
+        node_pub_key: &str,
     ) {
         match tx.tx_type.as_str() {
             "transfer" => {
                 if let Some(to_pub_key) = tx.payload.to_pub_key_hex.as_ref() {
                     let amount = tx.payload.amount.unwrap_or(0) as f64;
                     let is_burn = to_pub_key == BURN_ADDRESS;
-                    
-                    // Check if this is a token transfer (has token_symbol)
+                    let is_faucet = tx.payload.faucet == Some(true)
+                        && (!node_pub_key.is_empty() && tx.from_pub_key == node_pub_key
+                            || node_pub_key == "_rebuild_");
+
+                    if is_faucet {
+                        // Faucet mint: credit recipient without debiting sender
+                        *balances.entry(to_pub_key.clone()).or_insert(0.0) += amount;
+                        return;
+                    }
+
                     if let Some(token_symbol) = tx.payload.token_symbol.as_ref() {
-                        // Token transfer: deduct XRGE fee from sender
-                        *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
-                        
-                        // Track token balance changes
+                        let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                        if xrge_bal < tx.fee {
+                            eprintln!("[node] Rejecting transfer: insufficient XRGE for fee ({:.4} < {:.4})", xrge_bal, tx.fee);
+                            return;
+                        }
                         let sender_key = (tx.from_pub_key.clone(), token_symbol.clone());
+                        let token_bal = *token_balances.get(&sender_key).unwrap_or(&0.0);
+                        if token_bal < amount {
+                            eprintln!("[node] Rejecting transfer: insufficient {} ({:.4} < {:.4})", token_symbol, token_bal, amount);
+                            return;
+                        }
+
+                        *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
                         *token_balances.entry(sender_key).or_insert(0.0) -= amount;
                         
                         if is_burn {
-                            // Burn: add to burned_tokens tracker instead of recipient
                             *burned_tokens.entry(token_symbol.clone()).or_insert(0.0) += amount;
                         } else {
                             let recipient_key = (to_pub_key.clone(), token_symbol.clone());
                             *token_balances.entry(recipient_key).or_insert(0.0) += amount;
                         }
                     } else {
-                        // XRGE transfer
+                        let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                        if xrge_bal < amount + tx.fee {
+                            eprintln!("[node] Rejecting transfer: insufficient XRGE ({:.4} < {:.4})", xrge_bal, amount + tx.fee);
+                            return;
+                        }
+
                         *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= amount + tx.fee;
                         
                         if is_burn {
-                            // Burn XRGE: add to burned_tokens tracker
                             *burned_tokens.entry("XRGE".to_string()).or_insert(0.0) += amount;
                         } else {
                             *balances.entry(to_pub_key.clone()).or_insert(0.0) += amount;
                         }
                     }
-                    // Fees are distributed separately via distribute_fees()
                 }
             }
             "stake" => {
                 let amount = tx.payload.amount.unwrap_or(0) as f64;
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < amount + tx.fee {
+                    eprintln!("[node] Rejecting stake: insufficient XRGE ({:.4} < {:.4})", xrge_bal, amount + tx.fee);
+                    return;
+                }
                 *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= amount + tx.fee;
             }
             "unstake" => {
                 let amount = tx.payload.amount.unwrap_or(0) as f64;
+                // Verify staked balance before crediting
+                if let Some(vs) = validator_store {
+                    let staked = vs.get_validator(&tx.from_pub_key)
+                        .unwrap_or(None)
+                        .map(|v| v.stake)
+                        .unwrap_or(0);
+                    if (amount as u128) > staked {
+                        eprintln!("[node] Rejecting unstake: staked {} but requested {}", staked, amount);
+                        return;
+                    }
+                }
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < tx.fee {
+                    eprintln!("[node] Rejecting unstake: insufficient XRGE for fee ({:.4} < {:.4})", xrge_bal, tx.fee);
+                    return;
+                }
                 *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) += amount - tx.fee;
             }
             "create_token" => {
-                // Token creation fee is deducted from sender (XRGE)
+                const RESERVED: &[&str] = &["XRGE", "QETH", "QUSDC", "ETH", "USDC"];
+                if let Some(ref sym) = tx.payload.token_symbol {
+                    if RESERVED.contains(&sym.to_uppercase().as_str()) {
+                        eprintln!("[node] Rejecting create_token: reserved symbol '{}'", sym);
+                        return;
+                    }
+                }
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < tx.fee {
+                    eprintln!("[node] Rejecting create_token: insufficient XRGE ({:.4} < {:.4})", xrge_bal, tx.fee);
+                    return;
+                }
                 *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
                 
-                // Mint token supply to creator
                 if let Some(token_symbol) = tx.payload.token_symbol.as_ref() {
                     let total_supply = tx.payload.token_total_supply.unwrap_or(0) as f64;
                     let creator_key = (tx.from_pub_key.clone(), token_symbol.clone());
                     *token_balances.entry(creator_key).or_insert(0.0) += total_supply;
                 }
             }
+            "bridge_mint" => {
+                // Only the node operator key can issue bridge mints (skip check during rebuild)
+                if node_pub_key != "_rebuild_" && !node_pub_key.is_empty() && tx.from_pub_key != node_pub_key {
+                    eprintln!("[node] Rejecting bridge_mint: unauthorized sender (not node operator)");
+                    return;
+                }
+                if let (Some(to_pub_key), Some(token_symbol)) = (
+                    tx.payload.to_pub_key_hex.as_ref(),
+                    tx.payload.token_symbol.as_ref(),
+                ) {
+                    let amount = tx.payload.amount.unwrap_or(0) as f64;
+                    if amount > 0.0 {
+                        if token_symbol.to_uppercase() == "XRGE" {
+                            *balances.entry(to_pub_key.clone()).or_insert(0.0) += amount;
+                        } else {
+                            let recipient_key = (to_pub_key.clone(), token_symbol.clone());
+                            *token_balances.entry(recipient_key).or_insert(0.0) += amount;
+                        }
+                    }
+                }
+            }
+            "bridge_withdraw" => {
+                if let (Some(token_symbol), Some(amount)) = (
+                    tx.payload.token_symbol.as_ref(),
+                    tx.payload.amount,
+                ) {
+                    if amount > 0 {
+                        let token_upper = token_symbol.to_uppercase();
+                        let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                        if xrge_bal < tx.fee {
+                            eprintln!("[node] Rejecting bridge_withdraw: insufficient XRGE for fee ({:.4} < {:.4})", xrge_bal, tx.fee);
+                            return;
+                        }
+                        if token_upper == "XRGE" {
+                            if xrge_bal - tx.fee < amount as f64 {
+                                eprintln!("[node] Rejecting bridge_withdraw: insufficient XRGE ({:.4} < {})", xrge_bal - tx.fee, amount);
+                                return;
+                            }
+                            *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee + amount as f64;
+                        } else {
+                            let sender_key = (tx.from_pub_key.clone(), token_upper.clone());
+                            let token_bal = *token_balances.get(&sender_key).unwrap_or(&0.0);
+                            if token_bal < amount as f64 {
+                                eprintln!("[node] Rejecting bridge_withdraw: insufficient {} ({:.4} < {})", token_upper, token_bal, amount);
+                                return;
+                            }
+                            *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+                            *token_balances.entry(sender_key).or_insert(0.0) -= amount as f64;
+                        }
+                        *burned_tokens.entry(token_upper).or_insert(0.0) += amount as f64;
+                    }
+                }
+            }
             "slash" => {}
+            // Shielded transactions: fee deduction only (state is handled separately)
+            "shield" => {
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                let shield_amount = tx.payload.shielded_value.unwrap_or(0) as f64;
+                if xrge_bal < shield_amount + tx.fee {
+                    eprintln!("[node] Rejecting shield: insufficient XRGE ({:.4} < {:.4})", xrge_bal, shield_amount + tx.fee);
+                    return;
+                }
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= shield_amount + tx.fee;
+            }
+            "unshield" => {
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < tx.fee {
+                    eprintln!("[node] Rejecting unshield: insufficient XRGE for fee");
+                    return;
+                }
+                let unshield_amount = tx.payload.shielded_value.unwrap_or(0) as f64;
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) += unshield_amount;
+            }
+            "shielded_transfer" => {
+                // Fee is deducted from public balance (fee is always public)
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < tx.fee {
+                    eprintln!("[node] Rejecting shielded_transfer: insufficient XRGE for fee");
+                    return;
+                }
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+            }
             _ => {}
         }
     }
@@ -1708,6 +2587,349 @@ impl L1Node {
         self.validator_store.set_validator(public_key, state)
     }
 
+    // ===== NFT Methods =====
+
+    pub fn get_nft_collection(&self, collection_id: &str) -> Result<Option<NftCollection>, String> {
+        self.nft_store.get_collection(collection_id)
+    }
+
+    pub fn list_nft_collections(&self) -> Result<Vec<NftCollection>, String> {
+        self.nft_store.list_collections()
+    }
+
+    pub fn get_nft_token(&self, collection_id: &str, token_id: u64) -> Result<Option<NftToken>, String> {
+        self.nft_store.get_token(collection_id, token_id)
+    }
+
+    pub fn get_nft_tokens_by_collection(&self, collection_id: &str, limit: usize, offset: usize) -> Result<(Vec<NftToken>, usize), String> {
+        self.nft_store.get_tokens_by_collection(collection_id, limit, offset)
+    }
+
+    pub fn get_nfts_by_owner(&self, owner: &str) -> Result<Vec<NftToken>, String> {
+        self.nft_store.get_tokens_by_owner(owner)
+    }
+
+    /// Apply NFT transaction effects during block processing
+    fn apply_nft_tx_inner(
+        &self,
+        balances: &mut HashMap<String, f64>,
+        tx: &TxV1,
+        block_time: u64,
+    ) -> Result<(), String> {
+        match tx.tx_type.as_str() {
+            "nft_create_collection" => {
+                let symbol = tx.payload.nft_collection_symbol.as_ref().ok_or("missing nft_collection_symbol")?;
+                let name = tx.payload.nft_collection_name.as_ref().ok_or("missing nft_collection_name")?;
+                let collection_id = NftCollection::make_collection_id(&tx.from_pub_key, symbol);
+
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < tx.fee {
+                    eprintln!("[node] Rejecting nft_create_collection: insufficient XRGE ({:.4} < {:.4})", xrge_bal, tx.fee);
+                    return Ok(());
+                }
+
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+
+                let col = NftCollection {
+                    collection_id,
+                    symbol: symbol.to_uppercase(),
+                    name: name.clone(),
+                    creator: tx.from_pub_key.clone(),
+                    description: tx.payload.nft_description.clone(),
+                    image: tx.payload.nft_image.clone(),
+                    max_supply: tx.payload.nft_max_supply,
+                    minted: 0,
+                    royalty_bps: tx.payload.nft_royalty_bps.unwrap_or(0),
+                    royalty_recipient: tx.from_pub_key.clone(),
+                    frozen: false,
+                    created_at: block_time,
+                };
+                self.nft_store.save_collection(&col)?;
+            }
+            "nft_mint" => {
+                let col_id = tx.payload.nft_collection_id.as_ref().ok_or("missing nft_collection_id")?;
+                let token_name = tx.payload.nft_token_name.as_ref().ok_or("missing nft_token_name")?;
+
+                let mut col = match self.nft_store.get_collection(col_id)? {
+                    Some(c) => c,
+                    None => {
+                        eprintln!("[node] Warning: Collection {} not found, skipping nft_mint", col_id);
+                        return Ok(());
+                    }
+                };
+
+                if col.creator != tx.from_pub_key {
+                    eprintln!("[node] Rejecting nft_mint: {} is not the creator of collection {}", &tx.from_pub_key[..16], col_id);
+                    return Ok(());
+                }
+                if col.frozen {
+                    eprintln!("[node] Warning: Collection {} is frozen, skipping nft_mint", col_id);
+                    return Ok(());
+                }
+                if let Some(max) = col.max_supply {
+                    if col.minted >= max {
+                        eprintln!("[node] Warning: Collection {} reached max supply, skipping nft_mint", col_id);
+                        return Ok(());
+                    }
+                }
+
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < tx.fee {
+                    eprintln!("[node] Rejecting nft_mint: insufficient XRGE ({:.4} < {:.4})", xrge_bal, tx.fee);
+                    return Ok(());
+                }
+
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+
+                let token_id = col.minted + 1;
+                col.minted = token_id;
+                self.nft_store.save_collection(&col)?;
+
+                let token = NftToken {
+                    collection_id: col_id.clone(),
+                    token_id,
+                    owner: tx.from_pub_key.clone(),
+                    creator: tx.from_pub_key.clone(),
+                    name: token_name.clone(),
+                    metadata_uri: tx.payload.nft_metadata_uri.clone(),
+                    attributes: tx.payload.nft_attributes.clone(),
+                    locked: false,
+                    minted_at: block_time,
+                    transferred_at: block_time,
+                };
+                self.nft_store.save_token(&token)?;
+            }
+            "nft_batch_mint" => {
+                let col_id = tx.payload.nft_collection_id.as_ref().ok_or("missing nft_collection_id")?;
+                let names = tx.payload.nft_batch_names.as_ref().ok_or("missing nft_batch_names")?;
+
+                let mut col = match self.nft_store.get_collection(col_id)? {
+                    Some(c) => c,
+                    None => {
+                        eprintln!("[node] Warning: Collection {} not found, skipping nft_batch_mint", col_id);
+                        return Ok(());
+                    }
+                };
+
+                if col.creator != tx.from_pub_key {
+                    eprintln!("[node] Rejecting nft_batch_mint: {} is not the creator of collection {}", &tx.from_pub_key[..16], col_id);
+                    return Ok(());
+                }
+                if col.frozen {
+                    eprintln!("[node] Warning: Collection {} is frozen, skipping nft_batch_mint", col_id);
+                    return Ok(());
+                }
+                if let Some(max) = col.max_supply {
+                    if col.minted + names.len() as u64 > max {
+                        eprintln!("[node] Warning: Collection {} would exceed max supply, skipping nft_batch_mint", col_id);
+                        return Ok(());
+                    }
+                }
+
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < tx.fee {
+                    eprintln!("[node] Rejecting nft_batch_mint: insufficient XRGE ({:.4} < {:.4})", xrge_bal, tx.fee);
+                    return Ok(());
+                }
+
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+
+                let uris = tx.payload.nft_batch_uris.as_ref();
+                let attrs = tx.payload.nft_batch_attributes.as_ref();
+
+                for (i, name) in names.iter().enumerate() {
+                    let token_id = col.minted + 1;
+                    col.minted = token_id;
+
+                    let token = NftToken {
+                        collection_id: col_id.clone(),
+                        token_id,
+                        owner: tx.from_pub_key.clone(),
+                        creator: tx.from_pub_key.clone(),
+                        name: name.clone(),
+                        metadata_uri: uris.and_then(|u| u.get(i).cloned()),
+                        attributes: attrs.and_then(|a| a.get(i).cloned()),
+                        locked: false,
+                        minted_at: block_time,
+                        transferred_at: block_time,
+                    };
+                    self.nft_store.save_token(&token)?;
+                }
+                self.nft_store.save_collection(&col)?;
+            }
+            "nft_transfer" => {
+                let col_id = tx.payload.nft_collection_id.as_ref().ok_or("missing nft_collection_id")?;
+                let token_id = tx.payload.nft_token_id.ok_or("missing nft_token_id")?;
+                let to = tx.payload.to_pub_key_hex.as_ref().ok_or("missing to_pub_key_hex")?;
+
+                let mut token = match self.nft_store.get_token(col_id, token_id)? {
+                    Some(t) => t,
+                    None => {
+                        eprintln!("[node] Warning: NFT {}:{} not found, skipping transfer", col_id, token_id);
+                        return Ok(());
+                    }
+                };
+
+                if token.owner != tx.from_pub_key {
+                    eprintln!("[node] Warning: NFT {}:{} not owned by sender, skipping transfer", col_id, token_id);
+                    return Ok(());
+                }
+                if token.locked {
+                    eprintln!("[node] Warning: NFT {}:{} is locked, skipping transfer", col_id, token_id);
+                    return Ok(());
+                }
+
+                // Calculate total cost (fee + royalty)
+                let sale_price = tx.payload.amount.unwrap_or(0) as f64;
+                let mut total_cost = tx.fee;
+                let mut royalty_amount = 0.0;
+                if sale_price > 0.0 {
+                    if let Some(col) = self.nft_store.get_collection(col_id)? {
+                        if col.royalty_bps > 0 {
+                            royalty_amount = (sale_price * col.royalty_bps as f64) / 10000.0;
+                            total_cost += royalty_amount;
+                        }
+                    }
+                }
+
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < total_cost {
+                    eprintln!("[node] Rejecting nft_transfer: insufficient XRGE ({:.4} < {:.4})", xrge_bal, total_cost);
+                    return Ok(());
+                }
+
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+
+                if royalty_amount > 0.0 {
+                    if let Some(col) = self.nft_store.get_collection(col_id)? {
+                        *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= royalty_amount;
+                        *balances.entry(col.royalty_recipient.clone()).or_insert(0.0) += royalty_amount;
+                    }
+                }
+
+                token.owner = to.clone();
+                token.transferred_at = block_time;
+                self.nft_store.save_token(&token)?;
+            }
+            "nft_burn" => {
+                let col_id = tx.payload.nft_collection_id.as_ref().ok_or("missing nft_collection_id")?;
+                let token_id = tx.payload.nft_token_id.ok_or("missing nft_token_id")?;
+
+                if let Some(token) = self.nft_store.get_token(col_id, token_id)? {
+                    if token.owner != tx.from_pub_key {
+                        eprintln!("[node] Warning: NFT {}:{} not owned by sender, skipping burn", col_id, token_id);
+                        return Ok(());
+                    }
+                } else {
+                    eprintln!("[node] Warning: NFT {}:{} not found, skipping burn", col_id, token_id);
+                    return Ok(());
+                }
+
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < tx.fee {
+                    eprintln!("[node] Rejecting nft_burn: insufficient XRGE ({:.4} < {:.4})", xrge_bal, tx.fee);
+                    return Ok(());
+                }
+
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+                self.nft_store.delete_token(col_id, token_id)?;
+            }
+            "nft_lock" => {
+                let col_id = tx.payload.nft_collection_id.as_ref().ok_or("missing nft_collection_id")?;
+                let token_id = tx.payload.nft_token_id.ok_or("missing nft_token_id")?;
+                let locked = tx.payload.nft_locked.unwrap_or(true);
+
+                let mut token = match self.nft_store.get_token(col_id, token_id)? {
+                    Some(t) => t,
+                    None => return Ok(()),
+                };
+
+                if token.owner != tx.from_pub_key {
+                    eprintln!("[node] Warning: NFT {}:{} not owned by sender, skipping lock", col_id, token_id);
+                    return Ok(());
+                }
+
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < tx.fee {
+                    eprintln!("[node] Rejecting nft_lock: insufficient XRGE ({:.4} < {:.4})", xrge_bal, tx.fee);
+                    return Ok(());
+                }
+
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+
+                token.locked = locked;
+                self.nft_store.save_token(&token)?;
+            }
+            "nft_freeze_collection" => {
+                let col_id = tx.payload.nft_collection_id.as_ref().ok_or("missing nft_collection_id")?;
+                let frozen = tx.payload.nft_frozen.unwrap_or(true);
+
+                let mut col = match self.nft_store.get_collection(col_id)? {
+                    Some(c) => c,
+                    None => return Ok(()),
+                };
+
+                if col.creator != tx.from_pub_key {
+                    eprintln!("[node] Warning: Only creator can freeze collection {}, skipping", col_id);
+                    return Ok(());
+                }
+
+                let xrge_bal = *balances.get(&tx.from_pub_key).unwrap_or(&0.0);
+                if xrge_bal < tx.fee {
+                    eprintln!("[node] Rejecting nft_freeze_collection: insufficient XRGE ({:.4} < {:.4})", xrge_bal, tx.fee);
+                    return Ok(());
+                }
+
+                *balances.entry(tx.from_pub_key.clone()).or_insert(0.0) -= tx.fee;
+
+                col.frozen = frozen;
+                self.nft_store.save_collection(&col)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Rebuild NFT state (collections + tokens) from chain history
+    fn rebuild_nft_state(&self) -> Result<(), String> {
+        let blocks = self.store.get_all_blocks()?;
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        self.nft_store.clear_all()?;
+
+        let mut col_count = 0u32;
+        let mut token_count = 0u32;
+        let mut dummy_balances: HashMap<String, f64> = HashMap::new();
+
+        for block in &blocks {
+            for tx in &block.txs {
+                match tx.tx_type.as_str() {
+                    "nft_create_collection" | "nft_mint" | "nft_batch_mint"
+                    | "nft_transfer" | "nft_burn" | "nft_lock" | "nft_freeze_collection" => {
+                        if tx.tx_type == "nft_create_collection" {
+                            col_count += 1;
+                        }
+                        if tx.tx_type == "nft_mint" {
+                            token_count += 1;
+                        }
+                        if tx.tx_type == "nft_batch_mint" {
+                            token_count += tx.payload.nft_batch_names.as_ref().map(|n| n.len() as u32).unwrap_or(0);
+                        }
+                        let _ = self.apply_nft_tx_inner(&mut dummy_balances, tx, block.header.time);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if col_count > 0 || token_count > 0 {
+            eprintln!("[node] Rebuilt {} NFT collections, {} NFTs from chain history", col_count, token_count);
+        }
+        Ok(())
+    }
+
     pub fn list_wallets(&self) -> Result<Vec<MessengerWallet>, String> {
         self.messenger_store.list_wallets()
     }
@@ -1718,6 +2940,10 @@ impl L1Node {
 
     pub fn list_conversations(&self, wallet_id: &str) -> Result<Vec<Conversation>, String> {
         self.messenger_store.list_conversations(wallet_id)
+    }
+
+    pub fn list_conversations_with_activity(&self, wallet_id: &str, extra_keys: &[&str]) -> Result<Vec<serde_json::Value>, String> {
+        self.messenger_store.list_conversations_with_activity(wallet_id, extra_keys)
     }
 
     pub fn create_conversation(
@@ -1734,6 +2960,10 @@ impl L1Node {
         self.messenger_store.delete_conversation(conversation_id)
     }
 
+    pub fn delete_message(&self, message_id: &str) -> Result<(), String> {
+        self.messenger_store.delete_message(message_id)
+    }
+
     pub fn list_messages(&self, conversation_id: &str) -> Result<Vec<MessengerMessage>, String> {
         self.messenger_store.list_messages(conversation_id)
     }
@@ -1744,6 +2974,62 @@ impl L1Node {
 
     pub fn mark_message_read(&self, message_id: &str) -> Result<MessengerMessage, String> {
         self.messenger_store.mark_message_read(message_id)
+    }
+
+    pub fn cleanup_expired_messages(&self) -> Result<usize, String> {
+        self.messenger_store.cleanup_expired_messages()
+    }
+
+    // --- Name Registry ---
+
+    pub fn register_name(&self, name: &str, wallet_id: &str) -> Result<NameEntry, String> {
+        self.name_registry.register_name(name, wallet_id)
+    }
+
+    pub fn lookup_name(&self, name: &str) -> Result<Option<NameEntry>, String> {
+        self.name_registry.lookup_name(name)
+    }
+
+    pub fn reverse_lookup_name(&self, wallet_id: &str) -> Result<Option<String>, String> {
+        self.name_registry.reverse_lookup(wallet_id)
+    }
+
+    pub fn update_name_wallet_id(&self, old_id: &str, new_id: &str) -> Result<(), String> {
+        self.name_registry.update_wallet_id(old_id, new_id)
+    }
+
+    pub fn release_name(&self, name: &str, wallet_id: &str) -> Result<(), String> {
+        self.name_registry.release_name(name, wallet_id)
+    }
+
+    // --- Mail ---
+
+    pub fn send_mail(&self, msg: MailMessage) -> Result<MailMessage, String> {
+        self.mail_store.store_message(msg)
+    }
+
+    pub fn get_mail(&self, message_id: &str) -> Result<Option<MailMessage>, String> {
+        self.mail_store.get_message(message_id)
+    }
+
+    pub fn list_mail_folder(&self, wallet_id: &str, folder: &str) -> Result<Vec<(MailMessage, MailLabel)>, String> {
+        self.mail_store.list_folder(wallet_id, folder)
+    }
+
+    pub fn move_mail(&self, wallet_id: &str, message_id: &str, folder: &str) -> Result<(), String> {
+        self.mail_store.move_to_folder(wallet_id, message_id, folder)
+    }
+
+    pub fn mark_mail_read(&self, wallet_id: &str, message_id: &str) -> Result<(), String> {
+        self.mail_store.mark_read(wallet_id, message_id)
+    }
+
+    pub fn delete_mail(&self, wallet_id: &str, message_id: &str) -> Result<(), String> {
+        self.mail_store.delete_message(wallet_id, message_id)
+    }
+
+    pub fn update_mail_labels_wallet_id(&self, old_id: &str, new_id: &str) -> Result<usize, String> {
+        self.mail_store.update_labels_wallet_id(old_id, new_id)
     }
 
 }

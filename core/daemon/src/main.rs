@@ -1,5 +1,6 @@
 mod amm;
 mod grpc;
+mod nft_store;
 mod pool_events;
 mod node;
 mod peer;
@@ -23,9 +24,12 @@ use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::time::{sleep, Duration};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{Any, AllowOrigin, CorsLayer};
 
 use crate::websocket::WsBroadcaster;
+
+use quantum_vault_storage::bridge_claim_store::BridgeClaimStore;
+use quantum_vault_storage::bridge_withdraw_store::BridgeWithdrawStore;
 
 use crate::grpc::GrpcNode;
 use crate::node::{L1Node, NodeOptions};
@@ -38,13 +42,13 @@ use quantum_vault_types::ChainConfig;
 struct Args {
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
-    #[arg(long, default_value_t = 4100)]
+    #[arg(long, default_value_t = 4101)]
     port: u16,
-    #[arg(long, default_value_t = 5100)]
+    #[arg(long, default_value_t = 5101)]
     api_port: u16,
     #[arg(long, default_value = "rougechain-devnet-1")]
     chain_id: String,
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, default_value_t = 400)]
     block_time_ms: u64,
     #[arg(long)]
     mine: bool,
@@ -75,6 +79,15 @@ struct Args {
     /// Public URL of this node for peer discovery (e.g., "https://mynode.example.com")
     #[arg(long, env = "QV_PUBLIC_URL")]
     public_url: Option<String>,
+    /// Bridge: custody address that receives Base Sepolia ETH (enables bridge when set)
+    #[arg(long, env = "QV_BRIDGE_CUSTODY_ADDRESS")]
+    bridge_custody_address: Option<String>,
+    /// Bridge: Base Sepolia RPC URL (default: https://sepolia.base.org)
+    #[arg(long, env = "QV_BASE_SEPOLIA_RPC", default_value = "https://sepolia.base.org")]
+    base_sepolia_rpc: String,
+    /// Enable legacy v1 endpoints that accept private keys (UNSAFE — for local dev only)
+    #[arg(long)]
+    dev: bool,
 }
 
 #[derive(Clone)]
@@ -89,6 +102,15 @@ struct AppState {
     faucet_whitelist: Vec<String>,
     peer_manager: Arc<peer::PeerManager>,
     ws_broadcaster: Arc<WsBroadcaster>,
+    bridge_custody_address: Option<String>,
+    base_sepolia_rpc: String,
+    bridge_claim_store: Arc<BridgeClaimStore>,
+    bridge_withdraw_store: std::sync::Arc<BridgeWithdrawStore>,
+    bridge_relayer_secret: Option<String>,
+    xrge_bridge_vault: Option<String>,
+    xrge_bridge_token: String,
+    faucet_cooldowns: Arc<tokio::sync::Mutex<HashMap<String, i64>>>,
+    dev_mode: bool,
 }
 
 #[derive(Clone)]
@@ -180,10 +202,15 @@ async fn main() -> Result<(), String> {
         genesis_time: chrono::Utc::now().timestamp_millis() as u64,
         block_time_ms: args.block_time_ms,
     };
+    let data_dir_clone = data_dir.clone();
+    let bridge_withdraw_store = std::sync::Arc::new(
+        BridgeWithdrawStore::new(&data_dir_clone).map_err(|e| format!("bridge withdraw store: {}", e))?
+    );
     let node = Arc::new(L1Node::new(NodeOptions {
         data_dir,
         chain,
         mine: args.mine,
+        bridge_withdraw_store: Some(bridge_withdraw_store.clone()),
     })?);
     node.init()?;
 
@@ -231,6 +258,9 @@ async fn main() -> Result<(), String> {
     let peer_manager = Arc::new(peer::PeerManager::new(initial_peers.clone(), args.public_url.clone()));
     let ws_broadcaster = Arc::new(WsBroadcaster::new());
     
+    let bridge_claim_store = Arc::new(
+        BridgeClaimStore::new(&data_dir_clone).map_err(|e| format!("bridge store: {}", e))?
+    );
     let app_state = AppState {
         node: node.clone(),
         auth,
@@ -242,6 +272,18 @@ async fn main() -> Result<(), String> {
         faucet_whitelist: parse_whitelist(args.faucet_whitelist),
         peer_manager: peer_manager.clone(),
         ws_broadcaster: ws_broadcaster.clone(),
+        bridge_custody_address: args.bridge_custody_address.clone(),
+        base_sepolia_rpc: args.base_sepolia_rpc.clone(),
+        bridge_claim_store,
+        bridge_withdraw_store,
+        bridge_relayer_secret: std::env::var("BRIDGE_RELAYER_SECRET").ok().filter(|s| !s.is_empty()),
+        xrge_bridge_vault: std::env::var("XRGE_BRIDGE_VAULT").ok().filter(|s| !s.is_empty()),
+        xrge_bridge_token: std::env::var("XRGE_BRIDGE_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "0xF9e744a43608AB7D64a106df84e52915e8Efa27E".to_string()),
+        faucet_cooldowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        dev_mode: args.dev,
     };
     
     eprintln!("[core-daemon] WebSocket broadcaster initialized");
@@ -252,6 +294,26 @@ async fn main() -> Result<(), String> {
         let pm = peer_manager.clone();
         tokio::spawn(async move {
             peer::start_peer_sync(pm, peer_node).await;
+        });
+    }
+
+    // Background: clean up expired self-destruct messages every 30s
+    {
+        let cleanup_node = node.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(StdDuration::from_secs(30));
+            loop {
+                interval.tick().await;
+                match cleanup_node.cleanup_expired_messages() {
+                    Ok(n) if n > 0 => {
+                        eprintln!("[messenger] cleaned up {} expired self-destruct message(s)", n);
+                    }
+                    Err(e) => {
+                        eprintln!("[messenger] cleanup error: {}", e);
+                    }
+                    _ => {}
+                }
+            }
         });
     }
 
@@ -322,7 +384,10 @@ fn build_http_router(state: AppState) -> Router {
         .route("/api/health", get(get_health))
         .route("/api/blocks", get(get_blocks))
         .route("/api/blocks/import", post(import_block))
+        .route("/api/block/:height", get(get_block_by_height))
         .route("/api/txs", get(get_txs))
+        .route("/api/tx/:hash", get(get_tx_by_hash))
+        .route("/api/address/:public_key/transactions", get(get_address_transactions))
         .route("/api/blocks/summary", get(get_blocks_summary))
         .route("/api/balance/:public_key", get(get_balance))
         .route("/api/balance/:public_key/:token_symbol", get(get_token_balance))
@@ -348,6 +413,21 @@ fn build_http_router(state: AppState) -> Router {
         .route("/api/messenger/messages", get(get_messenger_messages))
         .route("/api/messenger/messages", post(send_messenger_message))
         .route("/api/messenger/messages/read", post(mark_messenger_read))
+        .route("/api/messenger/messages/:id", delete(delete_messenger_message))
+        // Name registry
+        .route("/api/names/register", post(register_name))
+        .route("/api/names/resolve/:name", get(resolve_name))
+        .route("/api/names/reverse/:walletId", get(reverse_lookup_name))
+        .route("/api/names/release", delete(release_name))
+        // Mail
+        .route("/api/mail/send", post(send_mail))
+        .route("/api/mail/inbox", get(get_mail_inbox))
+        .route("/api/mail/sent", get(get_mail_sent))
+        .route("/api/mail/trash", get(get_mail_trash))
+        .route("/api/mail/message/:id", get(get_mail_message))
+        .route("/api/mail/move", post(move_mail))
+        .route("/api/mail/read", post(mark_mail_read))
+        .route("/api/mail/:id", delete(delete_mail))
         .route("/api/peers", get(get_peers))
         .route("/api/peers/register", post(register_peer))
         // AMM/DEX endpoints
@@ -365,6 +445,8 @@ fn build_http_router(state: AppState) -> Router {
         // Secure v2 endpoints (client-side signing)
         .route("/api/v2/transfer", post(v2_transfer))
         .route("/api/v2/token/create", post(v2_create_token))
+        .route("/api/v2/token/metadata/update", post(v2_update_token_metadata))
+        .route("/api/v2/token/metadata/claim", post(v2_claim_token_metadata))
         .route("/api/v2/pool/create", post(v2_create_pool))
         .route("/api/v2/pool/add-liquidity", post(v2_add_liquidity))
         .route("/api/v2/pool/remove-liquidity", post(v2_remove_liquidity))
@@ -372,13 +454,61 @@ fn build_http_router(state: AppState) -> Router {
         .route("/api/v2/stake", post(v2_stake))
         .route("/api/v2/unstake", post(v2_unstake))
         .route("/api/v2/faucet", post(v2_faucet))
+        // NFT V2 write endpoints
+        .route("/api/v2/nft/collection/create", post(v2_nft_create_collection))
+        .route("/api/v2/nft/mint", post(v2_nft_mint))
+        .route("/api/v2/nft/batch-mint", post(v2_nft_batch_mint))
+        .route("/api/v2/nft/transfer", post(v2_nft_transfer))
+        .route("/api/v2/nft/burn", post(v2_nft_burn))
+        .route("/api/v2/nft/lock", post(v2_nft_lock))
+        .route("/api/v2/nft/freeze-collection", post(v2_nft_freeze_collection))
+        // NFT read-only endpoints
+        .route("/api/nft/collections", get(nft_list_collections))
+        .route("/api/nft/collection/:id", get(nft_get_collection))
+        .route("/api/nft/collection/:id/tokens", get(nft_get_collection_tokens))
+        .route("/api/nft/token/:collection_id/:token_id", get(nft_get_token))
+        .route("/api/nft/owner/:pubkey", get(nft_get_owner_nfts))
+        // Shielded transaction endpoints
+        .route("/api/v2/shielded/shield", post(v2_shield))
+        .route("/api/v2/shielded/transfer", post(v2_shielded_transfer))
+        .route("/api/v2/shielded/unshield", post(v2_unshield))
+        .route("/api/shielded/stats", get(shielded_stats))
+        .route("/api/shielded/nullifier/:hash", get(shielded_nullifier_check))
+        .route("/api/bridge/config", get(bridge_config))
+        .route("/api/bridge/claim", post(bridge_claim))
+        .route("/api/bridge/withdraw", post(bridge_withdraw))
+        .route("/api/bridge/withdrawals", get(bridge_withdrawals))
+        .route("/api/bridge/withdrawals/:tx_id", delete(bridge_withdrawal_fulfill))
+        // XRGE bridge endpoints
+        .route("/api/bridge/xrge/config", get(xrge_bridge_config))
+        .route("/api/bridge/xrge/claim", post(xrge_bridge_claim))
+        .route("/api/bridge/xrge/withdraw", post(xrge_bridge_withdraw))
+        .route("/api/bridge/xrge/withdrawals", get(xrge_bridge_withdrawals))
+        .route("/api/bridge/xrge/withdrawals/:tx_id", delete(xrge_bridge_fulfill))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
-        .layer(
-            CorsLayer::new()
+        .layer({
+            let cors_origins = std::env::var("QV_CORS_ORIGINS")
+                .ok()
+                .filter(|s| !s.is_empty());
+            let cors = CorsLayer::new()
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS, Method::PATCH])
-                .allow_origin(Any)
-                .allow_headers(Any),
-        )
+                .allow_headers(Any);
+            match cors_origins {
+                Some(origins) if origins != "*" => {
+                    let allowed: Vec<axum::http::HeaderValue> = origins
+                        .split(',')
+                        .filter_map(|o| o.trim().parse().ok())
+                        .collect();
+                    cors.allow_origin(AllowOrigin::list(allowed))
+                }
+                _ if state.dev_mode => cors.allow_origin(Any),
+                _ => cors.allow_origin(AllowOrigin::list([
+                    "http://localhost:5173".parse().unwrap(),
+                    "http://localhost:4173".parse().unwrap(),
+                    "http://127.0.0.1:5173".parse().unwrap(),
+                ])),
+            }
+        })
         .with_state(state)
 }
 
@@ -394,31 +524,46 @@ async fn auth_middleware<B>(
     if path == "/api/health" || path == "/api/stats" {
         return Ok(next.run(request).await);
     }
-    if path == "/api/faucet" || path == "/api/tx/submit" || path == "/api/stake/submit" || path == "/api/unstake/submit" || path == "/api/token/create" {
+    // v1 endpoints that accept private keys — block unless --dev flag is set
+    const V1_KEY_ENDPOINTS: &[&str] = &[
+        "/api/tx/submit",
+        "/api/stake/submit",
+        "/api/unstake/submit",
+        "/api/token/create",
+        "/api/pool/create",
+        "/api/pool/add-liquidity",
+        "/api/pool/remove-liquidity",
+        "/api/swap/execute",
+        "/api/token/metadata/update",
+        "/api/token/metadata/claim",
+        "/api/wallet/create",
+    ];
+    if V1_KEY_ENDPOINTS.iter().any(|ep| path == *ep) {
+        if !state.dev_mode {
+            return Err(StatusCode::GONE);
+        }
         return Ok(next.run(request).await);
     }
-    // Bypass rate limiting for secure v2 endpoints
-    if path.starts_with("/api/v2/") {
-        return Ok(next.run(request).await);
-    }
-    // Bypass rate limiting for messenger endpoints
-    if path.starts_with("/api/messenger/") {
-        return Ok(next.run(request).await);
-    }
+    // Auth bypass for endpoints that handle their own auth (v2 uses signatures, faucet/bridge are public)
+    let skip_auth = path == "/api/faucet"
+        || path.starts_with("/api/bridge/")
+        || path.starts_with("/api/v2/")
+        || path.starts_with("/api/messenger/")
+        || path.starts_with("/api/mail/")
+        || path.starts_with("/api/names/");
 
-    if state.auth.is_enabled() {
+    if !skip_auth && state.auth.is_enabled() {
         let api_key = extract_api_key(request.headers());
         if !state.auth.is_valid(api_key.as_deref()) {
             return Err(StatusCode::UNAUTHORIZED);
         }
     }
 
+    // Rate limiting applies to ALL endpoints
     let client_key = client_key(&request);
-    
-    // Determine rate limit tier
+
     let limit = determine_rate_limit_tier(&state, &request).await;
-    
-    // 0 = unlimited (skip rate limiting)
+
     if limit > 0 {
         let mut limiter = state.limiter.lock().await;
         if !limiter.allow(&client_key, limit) {
@@ -434,12 +579,33 @@ async fn auth_middleware<B>(
 /// - Tier 2 (peer_limit): Registered peers
 /// - Tier 3 (read/write_limit): Unknown clients
 async fn determine_rate_limit_tier<B>(state: &AppState, request: &Request<B>) -> u32 {
-    // Check for validator header (Tier 1)
-    if let Some(validator_key) = request.headers().get("x-validator-key") {
-        if let Ok(key_str) = validator_key.to_str() {
-            // Verify this is an active staked validator
-            if is_active_validator(&state.node, key_str) {
-                return state.validator_limit; // Tier 1
+    // Tier 1: validator must prove key ownership by signing a recent timestamp
+    // Headers: X-Validator-Key (pubkey), X-Validator-Sig (signature of timestamp), X-Validator-Ts (unix ms)
+    if let (Some(validator_key), Some(validator_sig), Some(validator_ts)) = (
+        request.headers().get("x-validator-key"),
+        request.headers().get("x-validator-sig"),
+        request.headers().get("x-validator-ts"),
+    ) {
+        if let (Ok(key_str), Ok(sig_str), Ok(ts_str)) = (
+            validator_key.to_str(),
+            validator_sig.to_str(),
+            validator_ts.to_str(),
+        ) {
+            if let Ok(ts) = ts_str.parse::<i64>() {
+                let now = chrono::Utc::now().timestamp_millis();
+                let drift = (now - ts).abs();
+                // Reject timestamps older than 30 seconds
+                if drift < 30_000 {
+                    if is_active_validator(&state.node, key_str) {
+                        if let Ok(true) = quantum_vault_crypto::pqc_verify(
+                            key_str,
+                            ts_str.as_bytes(),
+                            sig_str,
+                        ) {
+                            return state.validator_limit; // Tier 1 — proven
+                        }
+                    }
+                }
             }
         }
     }
@@ -487,6 +653,11 @@ fn extract_api_key(headers: &HeaderMap) -> Option<String> {
 }
 
 fn client_key<B>(request: &Request<B>) -> String {
+    // Prefer actual socket address to prevent IP spoofing via headers (MED-03)
+    if let Some(info) = request.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>() {
+        return info.0.ip().to_string();
+    }
+    // Fallback only when ConnectInfo is unavailable (e.g., behind trusted reverse proxy)
     if let Some(value) = request.headers().get("x-forwarded-for") {
         if let Ok(value) = value.to_str() {
             if let Some(first) = value.split(',').next() {
@@ -496,17 +667,6 @@ fn client_key<B>(request: &Request<B>) -> String {
                 }
             }
         }
-    }
-    if let Some(value) = request.headers().get("x-real-ip") {
-        if let Ok(value) = value.to_str() {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
-            }
-        }
-    }
-    if let Some(info) = request.extensions().get::<axum::extract::ConnectInfo<SocketAddr>>() {
-        return info.0.ip().to_string();
     }
     "unknown".to_string()
 }
@@ -832,11 +992,20 @@ async fn get_token_holders(
     let node = &state.node;
     
     // Get the original total supply from the create_token transaction
-    let original_supply = node.get_token_original_supply(&symbol).unwrap_or(0);
+    // For native XRGE, use the known total supply (no create_token tx exists)
+    let original_supply = if symbol.eq_ignore_ascii_case("XRGE") {
+        36_000_000_000u64
+    } else {
+        node.get_token_original_supply(&symbol).unwrap_or(0)
+    };
     
     // Get all wallet balances for this symbol
-    let wallet_balances = node.get_all_token_balances_for_symbol(&symbol).unwrap_or_default();
-    let wallet_total: f64 = wallet_balances.values().sum();
+    // For native XRGE, use the main balances map; for custom tokens, use token_balances
+    let wallet_balances = if symbol.eq_ignore_ascii_case("XRGE") {
+        node.get_all_native_balances().unwrap_or_default()
+    } else {
+        node.get_all_token_balances_for_symbol(&symbol).unwrap_or_default()
+    };
     
     // Get pool reserves for this token (tokens locked in liquidity)
     let pool_reserves = node.get_token_pool_reserves(&symbol).unwrap_or(0);
@@ -847,8 +1016,14 @@ async fn get_token_holders(
     // Total supply is the original minted amount
     let total_supply = original_supply as f64;
     
-    // Circulating supply = total - burned
-    let circulating_supply = total_supply - burned;
+    // Circulating supply = sum of all holder balances (most accurate)
+    // Falls back to total - burned if no holders found
+    let wallet_total: f64 = wallet_balances.values().sum();
+    let circulating_supply = if wallet_total > 0.0 {
+        wallet_total + pool_reserves as f64
+    } else {
+        total_supply - burned
+    };
     
     // Build holders list from wallet balances
     let mut holders: Vec<TokenHolder> = wallet_balances
@@ -1097,16 +1272,15 @@ struct BlocksResponse {
     blocks: Vec<quantum_vault_types::BlockV1>,
 }
 
+const MAX_BLOCK_PAGE_SIZE: usize = 100;
+
 async fn get_blocks(
     State(state): State<AppState>,
     Query(query): Query<BlocksQuery>,
 ) -> Result<Json<BlocksResponse>, StatusCode> {
     let node = &state.node;
-    let blocks = if let Some(limit) = query.limit {
-        node.get_recent_blocks(limit).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    } else {
-        node.get_all_blocks().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    };
+    let limit = query.limit.unwrap_or(MAX_BLOCK_PAGE_SIZE).min(MAX_BLOCK_PAGE_SIZE);
+    let blocks = node.get_recent_blocks(limit).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(BlocksResponse { blocks }))
 }
 
@@ -1130,6 +1304,141 @@ async fn import_block(
         }
         Err(e) => Ok(Json(ImportBlockResponse { success: false, error: Some(e) })),
     }
+}
+
+async fn get_block_by_height(
+    State(state): State<AppState>,
+    Path(height): Path<u64>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let node = &state.node;
+    match node.get_block(height) {
+        Ok(Some(block)) => {
+            let tx_count = block.txs.len();
+            let total_fees: f64 = block.txs.iter().map(|t| t.fee).sum();
+            let txs: Vec<serde_json::Value> = block.txs.iter().map(|tx| {
+                let tx_id = quantum_vault_crypto::bytes_to_hex(
+                    &quantum_vault_crypto::sha256(&quantum_vault_types::encode_tx_v1(tx)),
+                );
+                serde_json::json!({
+                    "txId": tx_id,
+                    "tx": tx,
+                })
+            }).collect();
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "block": {
+                    "height": block.header.height,
+                    "hash": block.hash,
+                    "prevHash": block.header.prev_hash,
+                    "time": block.header.time,
+                    "proposer": block.header.proposer_pub_key,
+                    "txHash": block.header.tx_hash,
+                    "txCount": tx_count,
+                    "totalFees": total_fees,
+                    "transactions": txs,
+                }
+            })))
+        }
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+}
+
+async fn get_tx_by_hash(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let node = &state.node;
+    let blocks = node.get_all_blocks().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // First pass: match by computed tx hash
+    for block in &blocks {
+        for tx in &block.txs {
+            let tx_id = quantum_vault_crypto::bytes_to_hex(
+                &quantum_vault_crypto::sha256(&quantum_vault_types::encode_tx_v1(tx)),
+            );
+            if tx_id == hash {
+                return Ok(Json(serde_json::json!({
+                    "success": true,
+                    "txId": tx_id,
+                    "blockHeight": block.header.height,
+                    "blockHash": block.hash,
+                    "blockTime": block.header.time,
+                    "tx": tx,
+                })));
+            }
+        }
+    }
+
+    // Second pass: match by block hash (frontend may pass block hash as tx identifier)
+    for block in &blocks {
+        if block.hash == hash {
+            if let Some(tx) = block.txs.first() {
+                let tx_id = quantum_vault_crypto::bytes_to_hex(
+                    &quantum_vault_crypto::sha256(&quantum_vault_types::encode_tx_v1(tx)),
+                );
+                return Ok(Json(serde_json::json!({
+                    "success": true,
+                    "txId": tx_id,
+                    "blockHeight": block.header.height,
+                    "blockHash": block.hash,
+                    "blockTime": block.header.time,
+                    "tx": tx,
+                })));
+            }
+        }
+    }
+
+    Err(StatusCode::NOT_FOUND)
+}
+
+#[derive(Deserialize)]
+struct AddressTxsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+async fn get_address_transactions(
+    State(state): State<AppState>,
+    Path(public_key): Path<String>,
+    Query(query): Query<AddressTxsQuery>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let node = &state.node;
+    let blocks = node.get_all_blocks().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for block in &blocks {
+        for tx in &block.txs {
+            let is_sender = tx.from_pub_key == public_key;
+            let is_recipient = tx.payload.to_pub_key_hex.as_deref() == Some(&public_key);
+            if is_sender || is_recipient {
+                let tx_id = quantum_vault_crypto::bytes_to_hex(
+                    &quantum_vault_crypto::sha256(&quantum_vault_types::encode_tx_v1(tx)),
+                );
+                items.push(serde_json::json!({
+                    "txId": tx_id,
+                    "blockHeight": block.header.height,
+                    "blockHash": block.hash,
+                    "blockTime": block.header.time,
+                    "direction": if is_sender { "out" } else { "in" },
+                    "tx": tx,
+                }));
+            }
+        }
+    }
+    items.sort_by(|a, b| {
+        let bt_a = a["blockTime"].as_u64().unwrap_or(0);
+        let bt_b = b["blockTime"].as_u64().unwrap_or(0);
+        bt_b.cmp(&bt_a)
+    });
+    let total = items.len();
+    let limit = query.limit.unwrap_or(50).min(500);
+    let offset = query.offset.unwrap_or(0);
+    let paged: Vec<serde_json::Value> = items.into_iter().skip(offset).take(limit).collect();
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "transactions": paged,
+        "total": total,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -1333,7 +1642,7 @@ async fn create_pool(
     Json(body): Json<CreatePoolRequest>,
 ) -> Result<Json<CreatePoolResponse>, (StatusCode, Json<serde_json::Value>)> {
     use quantum_vault_crypto::pqc_sign;
-    use quantum_vault_types::{TxPayload, TxV1, encode_tx_v1};
+    use quantum_vault_types::{TxPayload, TxV1, encode_tx_for_signing};
     
     let node = &state.node;
     let pool_id = LiquidityPool::make_pool_id(&body.token_a, &body.token_b);
@@ -1361,9 +1670,10 @@ async fn create_pool(
         },
         fee: 10.0, // Pool creation fee
         sig: String::new(),
+        signed_payload: None,
     };
     
-    let tx_bytes = encode_tx_v1(&tx);
+    let tx_bytes = encode_tx_for_signing(&tx);
     let sig = pqc_sign(&body.from_private_key, &tx_bytes)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
@@ -1393,7 +1703,7 @@ async fn add_liquidity(
     Json(body): Json<AddLiquidityRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use quantum_vault_crypto::pqc_sign;
-    use quantum_vault_types::{TxPayload, TxV1, encode_tx_v1};
+    use quantum_vault_types::{TxPayload, TxV1, encode_tx_for_signing};
     
     let node = &state.node;
     
@@ -1418,9 +1728,10 @@ async fn add_liquidity(
         },
         fee: 0.1,
         sig: String::new(),
+        signed_payload: None,
     };
     
-    let tx_bytes = encode_tx_v1(&tx);
+    let tx_bytes = encode_tx_for_signing(&tx);
     let sig = pqc_sign(&body.from_private_key, &tx_bytes)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
@@ -1448,7 +1759,7 @@ async fn remove_liquidity(
     Json(body): Json<RemoveLiquidityRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use quantum_vault_crypto::pqc_sign;
-    use quantum_vault_types::{TxPayload, TxV1, encode_tx_v1};
+    use quantum_vault_types::{TxPayload, TxV1, encode_tx_for_signing};
     
     let node = &state.node;
     
@@ -1464,9 +1775,10 @@ async fn remove_liquidity(
         },
         fee: 0.1,
         sig: String::new(),
+        signed_payload: None,
     };
     
-    let tx_bytes = encode_tx_v1(&tx);
+    let tx_bytes = encode_tx_for_signing(&tx);
     let sig = pqc_sign(&body.from_private_key, &tx_bytes)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
@@ -1537,10 +1849,38 @@ async fn execute_swap(
     Json(body): Json<ExecuteSwapRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use quantum_vault_crypto::pqc_sign;
-    use quantum_vault_types::{TxPayload, TxV1, encode_tx_v1};
+    use quantum_vault_types::{TxPayload, TxV1, encode_tx_for_signing};
     
     let node = &state.node;
-    
+    let swap_fee = 0.1_f64;
+
+    // Balance check
+    if body.token_in == "XRGE" {
+        let bal = node.get_balance(&body.from_public_key).unwrap_or(0.0);
+        let needed = body.amount_in as f64 + swap_fee;
+        if bal < needed {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient XRGE balance: have {:.4}, need {:.4}", bal, needed)
+            }))));
+        }
+    } else {
+        let xrge_bal = node.get_balance(&body.from_public_key).unwrap_or(0.0);
+        if xrge_bal < swap_fee {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient XRGE balance for fee: have {:.4}, need {:.4}", xrge_bal, swap_fee)
+            }))));
+        }
+        let token_bal = node.get_token_balance(&body.from_public_key, &body.token_in).unwrap_or(0.0);
+        if token_bal < body.amount_in as f64 {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient {} balance: have {:.4}, need {}", body.token_in, token_bal, body.amount_in)
+            }))));
+        }
+    }
+
     let tx = TxV1 {
         version: 1,
         tx_type: "swap".to_string(),
@@ -1554,11 +1894,12 @@ async fn execute_swap(
             swap_path: body.path,
             ..Default::default()
         },
-        fee: 0.1,
+        fee: swap_fee,
         sig: String::new(),
+        signed_payload: None,
     };
     
-    let tx_bytes = encode_tx_v1(&tx);
+    let tx_bytes = encode_tx_for_signing(&tx);
     let sig = pqc_sign(&body.from_private_key, &tx_bytes)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
@@ -1879,6 +2220,9 @@ struct FaucetRequest {
     amount: Option<u64>,
 }
 
+const FAUCET_COOLDOWN_SECS: i64 = 86400; // 24 hours
+const FAUCET_MAX_AMOUNT: u64 = 100_000;
+
 async fn faucet(
     State(state): State<AppState>,
     Json(body): Json<FaucetRequest>,
@@ -1887,10 +2231,41 @@ async fn faucet(
     if !state.faucet_whitelist.is_empty() {
         let recipient = normalize_recipient(&body.recipient_public_key);
         if !state.faucet_whitelist.iter().any(|item| item == &recipient) {
-            return Err(StatusCode::FORBIDDEN);
+            return Ok(Json(TxResponse {
+                success: false,
+                tx_id: None,
+                tx: None,
+                error: Some("Faucet restricted: your address is not whitelisted. Unset QV_FAUCET_WHITELIST for local dev.".to_string()),
+            }));
         }
     }
-    match node.submit_faucet_tx(&body.recipient_public_key, body.amount.unwrap_or(10000)) {
+
+    let amount = body.amount.unwrap_or(10000).min(FAUCET_MAX_AMOUNT);
+
+    let now = chrono::Utc::now().timestamp();
+    {
+        let mut cooldowns = state.faucet_cooldowns.lock().await;
+        if let Some(&last_used) = cooldowns.get(&body.recipient_public_key) {
+            let elapsed = now - last_used;
+            if elapsed < FAUCET_COOLDOWN_SECS {
+                let remaining = FAUCET_COOLDOWN_SECS - elapsed;
+                let hours = remaining / 3600;
+                let mins = (remaining % 3600) / 60;
+                return Ok(Json(TxResponse {
+                    success: false,
+                    tx_id: None,
+                    tx: None,
+                    error: Some(format!(
+                        "Faucet cooldown: please wait {}h {}m before requesting again.",
+                        hours, mins
+                    )),
+                }));
+            }
+        }
+        cooldowns.insert(body.recipient_public_key.clone(), now);
+    }
+
+    match node.submit_faucet_tx(&body.recipient_public_key, amount) {
         Ok(tx) => {
             let id = quantum_vault_crypto::bytes_to_hex(&quantum_vault_crypto::sha256(&quantum_vault_types::encode_tx_v1(&tx)));
             Ok(Json(TxResponse { success: true, tx_id: Some(id), tx: Some(tx), error: None }))
@@ -2130,14 +2505,54 @@ async fn register_messenger_wallet(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let node = &state.node;
+    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let display_name = body.get("displayName").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let signing_key = body.get("signingPublicKey").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let encryption_key = body.get("encryptionPublicKey").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+
+    // Enforce unique display names (case-insensitive)
+    // Also collect old wallet IDs that will be replaced (for name registry update)
+    let mut old_ids_to_update: Vec<String> = Vec::new();
+    if let Ok(existing_wallets) = node.list_wallets() {
+        let name_lower = display_name.to_lowercase();
+        for w in &existing_wallets {
+            if w.display_name.to_lowercase() == name_lower && w.id != id {
+                // Same display name but different ID -- check if it's the same user (same keys)
+                let same_keys = (!signing_key.is_empty() && w.signing_public_key == signing_key)
+                    || (!encryption_key.is_empty() && w.encryption_public_key == encryption_key);
+                if !same_keys {
+                    return Ok(Json(serde_json::json!({
+                        "success": false,
+                        "error": format!("Display name '{}' is already taken", display_name)
+                    })));
+                }
+            }
+            // Detect wallet entries that will be replaced by register_wallet
+            if w.id != id {
+                let will_replace = (!signing_key.is_empty() && w.signing_public_key == signing_key)
+                    || (!encryption_key.is_empty() && w.encryption_public_key == encryption_key);
+                if will_replace {
+                    old_ids_to_update.push(w.id.clone());
+                }
+            }
+        }
+    }
+
     let wallet = quantum_vault_storage::messenger_store::MessengerWallet {
-        id: body.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-        display_name: body.get("displayName").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-        signing_public_key: body.get("signingPublicKey").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-        encryption_public_key: body.get("encryptionPublicKey").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        id: id.clone(),
+        display_name,
+        signing_public_key: signing_key,
+        encryption_public_key: encryption_key,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
     let wallet = node.register_wallet(wallet).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Update name registry and mail labels that reference old wallet IDs
+    for old_id in &old_ids_to_update {
+        let _ = node.update_name_wallet_id(old_id, &id);
+        let _ = node.update_mail_labels_wallet_id(old_id, &id);
+    }
+
     Ok(Json(serde_json::json!({ "success": true, "wallet": wallet })))
 }
 
@@ -2147,7 +2562,13 @@ async fn get_messenger_conversations(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let node = &state.node;
     let wallet_id = query.get("walletId").cloned().unwrap_or_default();
-    let conversations = node.list_conversations(&wallet_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let signing_key = query.get("signingPublicKey").cloned().unwrap_or_default();
+    let encryption_key = query.get("encryptionPublicKey").cloned().unwrap_or_default();
+    let extra_keys: Vec<&str> = [signing_key.as_str(), encryption_key.as_str()]
+        .into_iter()
+        .filter(|k| !k.is_empty())
+        .collect();
+    let conversations = node.list_conversations_with_activity(&wallet_id, &extra_keys).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({ "success": true, "conversations": conversations })))
 }
 
@@ -2203,6 +2624,9 @@ async fn send_messenger_message(
         destruct_after_seconds: body.get("destructAfterSeconds").and_then(|v| v.as_u64()),
         created_at: chrono::Utc::now().to_rfc3339(),
         is_read: false,
+        read_at: None,
+        message_type: body.get("messageType").and_then(|v| v.as_str()).unwrap_or("text").to_string(),
+        spoiler: body.get("spoiler").and_then(|v| v.as_bool()).unwrap_or(false),
     };
     let message = node.send_message(message).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(Json(serde_json::json!({ "success": true, "message": message })))
@@ -2218,6 +2642,192 @@ async fn mark_messenger_read(
     Ok(Json(serde_json::json!({ "success": true, "message": message })))
 }
 
+async fn delete_messenger_message(
+    State(state): State<AppState>,
+    Path(message_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let node = &state.node;
+    match node.delete_message(&message_id) {
+        Ok(()) => Ok(Json(serde_json::json!({ "success": true }))),
+        Err(e) => Ok(Json(serde_json::json!({ "success": false, "error": e }))),
+    }
+}
+
+// ============================================
+// Name Registry endpoints
+// ============================================
+
+async fn register_name(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    let wallet_id = body.get("walletId").and_then(|v| v.as_str()).unwrap_or_default();
+    match state.node.register_name(name, wallet_id) {
+        Ok(entry) => Ok(Json(serde_json::json!({ "success": true, "entry": entry }))),
+        Err(e) => Ok(Json(serde_json::json!({ "success": false, "error": e }))),
+    }
+}
+
+async fn resolve_name(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let entry = state.node.lookup_name(&name).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match entry {
+        Some(e) => {
+            let wallets = state.node.list_wallets().unwrap_or_default();
+            // Try exact ID match first, then fall back to key-based matching
+            let wallet = wallets.iter().find(|w| w.id == e.wallet_id)
+                .or_else(|| wallets.iter().find(|w|
+                    w.signing_public_key == e.wallet_id || w.encryption_public_key == e.wallet_id
+                ));
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "entry": e,
+                "wallet": wallet,
+            })))
+        }
+        None => Ok(Json(serde_json::json!({ "success": false, "error": "Name not found" }))),
+    }
+}
+
+async fn reverse_lookup_name(
+    State(state): State<AppState>,
+    Path(wallet_id): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let name = state.node.reverse_lookup_name(&wallet_id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "success": true, "name": name })))
+}
+
+async fn release_name(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let name = body.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    let wallet_id = body.get("walletId").and_then(|v| v.as_str()).unwrap_or_default();
+    match state.node.release_name(name, wallet_id) {
+        Ok(()) => Ok(Json(serde_json::json!({ "success": true }))),
+        Err(e) => Ok(Json(serde_json::json!({ "success": false, "error": e }))),
+    }
+}
+
+// ============================================
+// Mail endpoints
+// ============================================
+
+async fn send_mail(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let msg = quantum_vault_storage::mail_store::MailMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        from_wallet_id: body.get("fromWalletId").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        to_wallet_ids: body.get("toWalletIds")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default(),
+        subject_encrypted: body.get("subjectEncrypted").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        body_encrypted: body.get("bodyEncrypted").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        signature: body.get("signature").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        reply_to_id: body.get("replyToId").and_then(|v| v.as_str()).map(|s| s.to_string()),
+        has_attachment: body.get("hasAttachment").and_then(|v| v.as_bool()).unwrap_or(false),
+        attachment_hash: body.get("attachmentHash").and_then(|v| v.as_str()).map(|s| s.to_string()),
+    };
+    let msg = state.node.send_mail(msg).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(serde_json::json!({ "success": true, "message": msg })))
+}
+
+async fn get_mail_inbox(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let wallet_id = query.get("walletId").cloned().unwrap_or_default();
+    let items = state.node.list_mail_folder(&wallet_id, "inbox").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let messages: Vec<serde_json::Value> = items.into_iter().map(|(msg, label)| {
+        serde_json::json!({ "message": msg, "label": label })
+    }).collect();
+    Ok(Json(serde_json::json!({ "success": true, "messages": messages })))
+}
+
+async fn get_mail_sent(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let wallet_id = query.get("walletId").cloned().unwrap_or_default();
+    let items = state.node.list_mail_folder(&wallet_id, "sent").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let messages: Vec<serde_json::Value> = items.into_iter().map(|(msg, label)| {
+        serde_json::json!({ "message": msg, "label": label })
+    }).collect();
+    Ok(Json(serde_json::json!({ "success": true, "messages": messages })))
+}
+
+async fn get_mail_trash(
+    State(state): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let wallet_id = query.get("walletId").cloned().unwrap_or_default();
+    let items = state.node.list_mail_folder(&wallet_id, "trash").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let messages: Vec<serde_json::Value> = items.into_iter().map(|(msg, label)| {
+        serde_json::json!({ "message": msg, "label": label })
+    }).collect();
+    Ok(Json(serde_json::json!({ "success": true, "messages": messages })))
+}
+
+async fn get_mail_message(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let wallet_id = query.get("walletId").cloned().unwrap_or_default();
+    let msg = state.node.get_mail(&id).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if !wallet_id.is_empty() {
+        let _ = state.node.mark_mail_read(&wallet_id, &id);
+    }
+    match msg {
+        Some(m) => Ok(Json(serde_json::json!({ "success": true, "message": m }))),
+        None => Ok(Json(serde_json::json!({ "success": false, "error": "Message not found" }))),
+    }
+}
+
+async fn move_mail(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let wallet_id = body.get("walletId").and_then(|v| v.as_str()).unwrap_or_default();
+    let message_id = body.get("messageId").and_then(|v| v.as_str()).unwrap_or_default();
+    let folder = body.get("folder").and_then(|v| v.as_str()).unwrap_or_default();
+    match state.node.move_mail(wallet_id, message_id, folder) {
+        Ok(()) => Ok(Json(serde_json::json!({ "success": true }))),
+        Err(e) => Ok(Json(serde_json::json!({ "success": false, "error": e }))),
+    }
+}
+
+async fn mark_mail_read(
+    State(state): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let wallet_id = body.get("walletId").and_then(|v| v.as_str()).unwrap_or_default();
+    let message_id = body.get("messageId").and_then(|v| v.as_str()).unwrap_or_default();
+    match state.node.mark_mail_read(wallet_id, message_id) {
+        Ok(()) => Ok(Json(serde_json::json!({ "success": true }))),
+        Err(e) => Ok(Json(serde_json::json!({ "success": false, "error": e }))),
+    }
+}
+
+async fn delete_mail(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let wallet_id = query.get("walletId").cloned().unwrap_or_default();
+    match state.node.delete_mail(&wallet_id, &id) {
+        Ok(()) => Ok(Json(serde_json::json!({ "success": true }))),
+        Err(e) => Ok(Json(serde_json::json!({ "success": false, "error": e }))),
+    }
+}
+
 // ============================================
 // Secure v2 API endpoints (client-side signing)
 // ============================================
@@ -2230,8 +2840,9 @@ struct SignedTransactionRequest {
     public_key: String,
 }
 
-/// Verify a signed transaction from the frontend
-fn verify_signed_tx(req: &SignedTransactionRequest) -> Result<(), String> {
+/// Verify a signed transaction from the frontend.
+/// Returns the serialized payload JSON on success (the exact bytes that were signed).
+fn verify_signed_tx(req: &SignedTransactionRequest) -> Result<String, String> {
     use quantum_vault_crypto::pqc_verify;
     
     // Serialize payload deterministically (sorted keys)
@@ -2247,48 +2858,83 @@ fn verify_signed_tx(req: &SignedTransactionRequest) -> Result<(), String> {
         return Err("Invalid signature".to_string());
     }
     
-    // Check timestamp is within acceptable range (5 minutes)
-    if let Some(timestamp) = req.payload.get("timestamp").and_then(|v| v.as_i64()) {
-        let now = chrono::Utc::now().timestamp_millis();
-        let diff = (now - timestamp).abs();
-        if diff > 5 * 60 * 1000 {
-            return Err("Transaction expired (timestamp too old)".to_string());
-        }
+    // Require timestamp within acceptable range (5 minutes) to prevent replay
+    let timestamp = req.payload.get("timestamp").and_then(|v| v.as_i64())
+        .ok_or_else(|| "payload must include a 'timestamp' field".to_string())?;
+    let now = chrono::Utc::now().timestamp_millis();
+    let diff = (now - timestamp).abs();
+    if diff > 5 * 60 * 1000 {
+        return Err("Transaction expired (timestamp too old or too far in the future)".to_string());
     }
     
-    // Check 'from' matches public key
+    // Require 'from' matches public key to prevent impersonation
     if let Some(from) = req.payload.get("from").and_then(|v| v.as_str()) {
         if from != req.public_key {
             return Err("Payload 'from' does not match signing public key".to_string());
         }
     }
     
-    Ok(())
+    Ok(payload_json)
 }
 
 async fn v2_transfer(
     State(state): State<AppState>,
     Json(body): Json<SignedTransactionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    use quantum_vault_types::{TxPayload, TxV1, encode_tx_v1};
-    use quantum_vault_crypto::pqc_sign;
+    use quantum_vault_types::{TxPayload, TxV1};
     
-    // Verify the signature
-    verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
     let node = &state.node;
     let payload = &body.payload;
     
     let to = payload.get("to").and_then(|v| v.as_str()).unwrap_or_default();
     let amount = payload.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let fee = payload.get("fee").and_then(|v| v.as_f64()).unwrap_or(1.0);
     let token = payload.get("token").and_then(|v| v.as_str()).unwrap_or("XRGE");
+    let fee = 1.0_f64; // Server-enforced minimum fee
+
+    if to.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "recipient address is required"}))));
+    }
+    if to == body.public_key {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "cannot transfer to yourself"}))));
+    }
+    if amount <= 0.0 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "amount must be greater than zero"}))));
+    }
+
+    // Balance check
+    if token == "XRGE" {
+        let bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+        if bal < amount + fee {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient XRGE balance: have {:.4}, need {:.4}", bal, amount + fee)
+            }))));
+        }
+    } else {
+        let xrge_bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+        if xrge_bal < fee {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient XRGE for fee: have {:.4}, need {:.4}", xrge_bal, fee)
+            }))));
+        }
+        let token_bal = node.get_token_balance(&body.public_key, token).unwrap_or(0.0);
+        if token_bal < amount {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient {} balance: have {:.4}, need {:.4}", token, token_bal, amount)
+            }))));
+        }
+    }
     
     let tx = TxV1 {
         version: 1,
         tx_type: "transfer".to_string(),
         from_pub_key: body.public_key.clone(),
-        nonce: chrono::Utc::now().timestamp_millis() as u64,
+        nonce: payload.get("nonce").and_then(|v| v.as_u64())
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() as u64),
         payload: TxPayload {
             to_pub_key_hex: Some(to.to_string()),
             amount: Some(amount as u64),
@@ -2296,7 +2942,8 @@ async fn v2_transfer(
             ..Default::default()
         },
         fee,
-        sig: body.signature.clone(), // Use client signature
+        sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
     };
     
     node.add_tx_to_mempool(tx)
@@ -2314,7 +2961,7 @@ async fn v2_create_token(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use quantum_vault_types::{TxPayload, TxV1};
     
-    verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
     let node = &state.node;
     let payload = &body.payload;
@@ -2322,7 +2969,23 @@ async fn v2_create_token(
     let token_name = payload.get("token_name").and_then(|v| v.as_str()).unwrap_or_default();
     let token_symbol = payload.get("token_symbol").and_then(|v| v.as_str()).unwrap_or_default();
     let initial_supply = payload.get("initial_supply").and_then(|v| v.as_u64()).unwrap_or(0);
-    let fee = payload.get("fee").and_then(|v| v.as_f64()).unwrap_or(10.0);
+    let token_image = payload.get("image").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let fee = 100.0_f64; // Server-enforced token creation fee
+
+    if token_name.is_empty() || token_symbol.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "token_name and token_symbol are required"}))));
+    }
+    if initial_supply == 0 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "initial_supply must be greater than zero"}))));
+    }
+
+    let bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": format!("insufficient XRGE for token creation fee: have {:.4}, need {:.4}", bal, fee)
+        }))));
+    }
     
     let tx = TxV1 {
         version: 1,
@@ -2338,16 +3001,87 @@ async fn v2_create_token(
         },
         fee,
         sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
     };
     
     node.add_tx_to_mempool(tx)
         .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
-    
+
+    let _ = node.register_token_metadata(
+        token_symbol,
+        token_name,
+        &body.public_key,
+        token_image,
+        None,
+    );
+
     Ok(Json(serde_json::json!({
         "success": true,
         "token_symbol": token_symbol,
         "message": "Token creation transaction submitted"
     })))
+}
+
+async fn v2_update_token_metadata(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _ = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let node = &state.node;
+    let payload = &body.payload;
+
+    let token_symbol = payload.get("token_symbol").and_then(|v| v.as_str()).unwrap_or_default();
+    if token_symbol.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "token_symbol is required"}))));
+    }
+
+    match node.is_token_creator(token_symbol, &body.public_key) {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "error": "Only the token creator can update metadata"}))));
+        }
+        Err(e) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"success": false, "error": e}))));
+        }
+    }
+
+    let image = payload.get("image").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let description = payload.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let website = payload.get("website").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let twitter = payload.get("twitter").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let discord = payload.get("discord").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+    match node.update_token_metadata(token_symbol, &body.public_key, image, description, website, twitter, discord) {
+        Ok(()) => Ok(Json(serde_json::json!({
+            "success": true,
+            "message": "Token metadata updated successfully"
+        }))),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e})))),
+    }
+}
+
+async fn v2_claim_token_metadata(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let _ = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let node = &state.node;
+    let payload = &body.payload;
+
+    let token_symbol = payload.get("token_symbol").and_then(|v| v.as_str()).unwrap_or_default();
+    if token_symbol.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "token_symbol is required"}))));
+    }
+
+    match node.claim_token_metadata(token_symbol, &body.public_key) {
+        Ok(()) => Ok(Json(serde_json::json!({
+            "success": true,
+            "message": "Token metadata claimed successfully. You can now update it."
+        }))),
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e})))),
+    }
 }
 
 async fn v2_create_pool(
@@ -2356,7 +3090,7 @@ async fn v2_create_pool(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use quantum_vault_types::{TxPayload, TxV1};
     
-    verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
     let node = &state.node;
     let payload = &body.payload;
@@ -2365,6 +3099,16 @@ async fn v2_create_pool(
     let token_b = payload.get("token_b").and_then(|v| v.as_str()).unwrap_or_default();
     let amount_a = payload.get("amount_a").and_then(|v| v.as_u64()).unwrap_or(0);
     let amount_b = payload.get("amount_b").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    if token_a.is_empty() || token_b.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "both token symbols are required"}))));
+    }
+    if token_a == token_b {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "cannot create pool with the same token on both sides"}))));
+    }
+    if amount_a == 0 || amount_b == 0 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "initial liquidity amounts must be greater than zero"}))));
+    }
     
     let pool_id = LiquidityPool::make_pool_id(token_a, token_b);
     
@@ -2374,6 +3118,40 @@ async fn v2_create_pool(
             "success": false,
             "error": format!("Pool {} already exists", pool_id)
         }))));
+    }
+
+    let pool_fee = 10.0_f64;
+
+    // Balance check for pool creation
+    let mut xrge_needed = pool_fee;
+    if token_a == "XRGE" { xrge_needed += amount_a as f64; }
+    if token_b == "XRGE" { xrge_needed += amount_b as f64; }
+
+    let xrge_bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+    if xrge_bal < xrge_needed {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": format!("insufficient XRGE balance: have {:.4}, need {:.4}", xrge_bal, xrge_needed)
+        }))));
+    }
+
+    if token_a != "XRGE" {
+        let bal = node.get_token_balance(&body.public_key, token_a).unwrap_or(0.0);
+        if bal < amount_a as f64 {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient {} balance: have {:.4}, need {}", token_a, bal, amount_a)
+            }))));
+        }
+    }
+    if token_b != "XRGE" {
+        let bal = node.get_token_balance(&body.public_key, token_b).unwrap_or(0.0);
+        if bal < amount_b as f64 {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient {} balance: have {:.4}, need {}", token_b, bal, amount_b)
+            }))));
+        }
     }
     
     let tx = TxV1 {
@@ -2389,8 +3167,9 @@ async fn v2_create_pool(
             amount_b: Some(amount_b),
             ..Default::default()
         },
-        fee: 10.0,
+        fee: pool_fee,
         sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
     };
     
     node.add_tx_to_mempool(tx)
@@ -2409,7 +3188,7 @@ async fn v2_add_liquidity(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use quantum_vault_types::{TxPayload, TxV1};
     
-    verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
     let node = &state.node;
     let payload = &body.payload;
@@ -2417,7 +3196,49 @@ async fn v2_add_liquidity(
     let pool_id = payload.get("pool_id").and_then(|v| v.as_str()).unwrap_or_default();
     let amount_a = payload.get("amount_a").and_then(|v| v.as_u64()).unwrap_or(0);
     let amount_b = payload.get("amount_b").and_then(|v| v.as_u64()).unwrap_or(0);
-    
+
+    let liq_fee = 1.0_f64;
+
+    // Balance check for add_liquidity
+    if let Ok(Some(pool)) = node.get_pool(pool_id) {
+        let mut xrge_needed = liq_fee;
+        if pool.token_a == "XRGE" { xrge_needed += amount_a as f64; }
+        if pool.token_b == "XRGE" { xrge_needed += amount_b as f64; }
+
+        let xrge_bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+        if xrge_bal < xrge_needed {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient XRGE balance: have {:.4}, need {:.4}", xrge_bal, xrge_needed)
+            }))));
+        }
+
+        if pool.token_a != "XRGE" {
+            let bal = node.get_token_balance(&body.public_key, &pool.token_a).unwrap_or(0.0);
+            if bal < amount_a as f64 {
+                return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("insufficient {} balance: have {:.4}, need {}", pool.token_a, bal, amount_a)
+                }))));
+            }
+        }
+        if pool.token_b != "XRGE" {
+            let bal = node.get_token_balance(&body.public_key, &pool.token_b).unwrap_or(0.0);
+            if bal < amount_b as f64 {
+                return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("insufficient {} balance: have {:.4}, need {}", pool.token_b, bal, amount_b)
+                }))));
+            }
+        }
+    } else {
+        return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"success": false, "error": "pool not found"}))));
+    }
+
+    if amount_a == 0 || amount_b == 0 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "liquidity amounts must be greater than zero"}))));
+    }
+
     let tx = TxV1 {
         version: 1,
         tx_type: "add_liquidity".to_string(),
@@ -2429,8 +3250,9 @@ async fn v2_add_liquidity(
             amount_b: Some(amount_b),
             ..Default::default()
         },
-        fee: 1.0,
+        fee: liq_fee,
         sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
     };
     
     node.add_tx_to_mempool(tx)
@@ -2448,13 +3270,44 @@ async fn v2_remove_liquidity(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use quantum_vault_types::{TxPayload, TxV1};
     
-    verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
     let node = &state.node;
     let payload = &body.payload;
     
     let pool_id = payload.get("pool_id").and_then(|v| v.as_str()).unwrap_or_default();
     let lp_amount = payload.get("lp_amount").and_then(|v| v.as_u64()).unwrap_or(0);
+    let remove_fee = 1.0_f64;
+
+    if lp_amount == 0 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "lp_amount must be greater than zero"}))));
+    }
+
+    // Verify pool exists
+    match node.get_pool(pool_id) {
+        Ok(Some(_)) => {}
+        _ => {
+            return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"success": false, "error": "pool not found"}))));
+        }
+    }
+
+    // Verify LP token ownership
+    let lp_bal = node.get_lp_balance(&body.public_key, pool_id).unwrap_or(0.0);
+    if lp_bal < lp_amount as f64 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": format!("insufficient LP tokens: have {:.4}, want to remove {}", lp_bal, lp_amount)
+        }))));
+    }
+
+    // Verify XRGE for fee
+    let xrge_bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+    if xrge_bal < remove_fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": format!("insufficient XRGE for fee: have {:.4}, need {:.4}", xrge_bal, remove_fee)
+        }))));
+    }
     
     let tx = TxV1 {
         version: 1,
@@ -2466,8 +3319,9 @@ async fn v2_remove_liquidity(
             lp_amount: Some(lp_amount),
             ..Default::default()
         },
-        fee: 1.0,
+        fee: remove_fee,
         sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
     };
     
     node.add_tx_to_mempool(tx)
@@ -2485,7 +3339,7 @@ async fn v2_execute_swap(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use quantum_vault_types::{TxPayload, TxV1};
     
-    verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
     let node = &state.node;
     let payload = &body.payload;
@@ -2495,7 +3349,45 @@ async fn v2_execute_swap(
     let amount_in = payload.get("amount_in").and_then(|v| v.as_u64()).unwrap_or(0);
     let min_amount_out = payload.get("min_amount_out").and_then(|v| v.as_u64()).unwrap_or(0);
     
-    // Get pool for swap
+    let swap_fee = 1.0_f64;
+
+    if token_in.is_empty() || token_out.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "token_in and token_out are required"}))));
+    }
+    if token_in == token_out {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "cannot swap a token for itself"}))));
+    }
+    if amount_in == 0 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "amount_in must be greater than zero"}))));
+    }
+
+    // Balance check: ensure user can cover input amount + fee
+    if token_in == "XRGE" {
+        let bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+        let needed = amount_in as f64 + swap_fee;
+        if bal < needed {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient XRGE balance: have {:.4}, need {:.4} (amount {} + fee {})", bal, needed, amount_in, swap_fee)
+            }))));
+        }
+    } else {
+        let xrge_bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+        if xrge_bal < swap_fee {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient XRGE balance for fee: have {:.4}, need {:.4}", xrge_bal, swap_fee)
+            }))));
+        }
+        let token_bal = node.get_token_balance(&body.public_key, token_in).unwrap_or(0.0);
+        if token_bal < amount_in as f64 {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient {} balance: have {:.4}, need {}", token_in, token_bal, amount_in)
+            }))));
+        }
+    }
+
     let pool_id = LiquidityPool::make_pool_id(token_in, token_out);
     
     let tx = TxV1 {
@@ -2512,8 +3404,9 @@ async fn v2_execute_swap(
             min_amount_out: Some(min_amount_out),
             ..Default::default()
         },
-        fee: 1.0,
+        fee: swap_fee,
         sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
     };
     
     node.add_tx_to_mempool(tx)
@@ -2531,13 +3424,25 @@ async fn v2_stake(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use quantum_vault_types::{TxPayload, TxV1};
     
-    verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
     let node = &state.node;
     let payload = &body.payload;
     
     let amount = payload.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
-    let fee = payload.get("fee").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let fee = 1.0_f64; // Server-enforced fee
+
+    if amount == 0 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "stake amount must be greater than zero"}))));
+    }
+
+    let bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < amount as f64 + fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": format!("insufficient XRGE balance: have {:.4}, need {:.4}", bal, amount as f64 + fee)
+        }))));
+    }
     
     let tx = TxV1 {
         version: 1,
@@ -2550,6 +3455,7 @@ async fn v2_stake(
         },
         fee,
         sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
     };
     
     node.add_tx_to_mempool(tx)
@@ -2567,13 +3473,40 @@ async fn v2_unstake(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     use quantum_vault_types::{TxPayload, TxV1};
     
-    verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
     let node = &state.node;
     let payload = &body.payload;
     
     let amount = payload.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
-    let fee = payload.get("fee").and_then(|v| v.as_f64()).unwrap_or(1.0);
+    let fee = 1.0_f64; // Server-enforced fee
+
+    if amount == 0 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "unstake amount must be greater than zero"}))));
+    }
+
+    // Verify user actually has this amount staked
+    if let Ok(validators) = node.list_validators() {
+        let staked = validators.iter()
+            .find(|(pk, _)| pk == &body.public_key)
+            .map(|(_, vs)| vs.stake)
+            .unwrap_or(0);
+        if (amount as u128) > staked {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "success": false,
+                "error": format!("insufficient staked balance: have {}, want to unstake {}", staked, amount)
+            }))));
+        }
+    }
+
+    // Check XRGE for fee (unstake returns XRGE, but fee must be payable)
+    let bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": format!("insufficient XRGE for unstake fee: have {:.4}, need {:.4}", bal, fee)
+        }))));
+    }
     
     let tx = TxV1 {
         version: 1,
@@ -2586,6 +3519,7 @@ async fn v2_unstake(
         },
         fee,
         sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
     };
     
     node.add_tx_to_mempool(tx)
@@ -2601,32 +3535,1303 @@ async fn v2_faucet(
     State(state): State<AppState>,
     Json(body): Json<SignedTransactionRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    use quantum_vault_types::{TxPayload, TxV1};
-    
-    verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+    let _ = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
     
     let node = &state.node;
-    
-    let tx = TxV1 {
-        version: 1,
-        tx_type: "faucet".to_string(),
-        from_pub_key: body.public_key.clone(),
-        nonce: chrono::Utc::now().timestamp_millis() as u64,
-        payload: TxPayload {
-            faucet: Some(true),
-            ..Default::default()
-        },
-        fee: 0.0,
-        sig: body.signature.clone(),
-    };
-    
-    node.add_tx_to_mempool(tx)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+    let faucet_amount = 10000_u64;
+
+    // Rate limit: check if user already has a significant balance (anti-abuse)
+    let bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal > 50000.0 {
+        return Err((StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+            "success": false,
+            "error": "faucet not available: your balance exceeds the faucet threshold"
+        }))));
+    }
+
+    // Check mempool for existing faucet requests from this user
+    {
+        let mempool = node.get_mempool_snapshot();
+        let pending_faucet = mempool.iter().any(|tx| {
+            tx.payload.faucet == Some(true) && tx.payload.to_pub_key_hex.as_deref() == Some(&body.public_key)
+        });
+        if pending_faucet {
+            return Err((StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({
+                "success": false,
+                "error": "you already have a pending faucet request"
+            }))));
+        }
+    }
+
+    // Use the node's built-in faucet mechanism (creates a proper transfer tx from node key)
+    node.submit_faucet_tx(&body.public_key, faucet_amount)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"success": false, "error": e}))))?;
     
     Ok(Json(serde_json::json!({
         "success": true,
-        "message": "Faucet request submitted"
+        "message": format!("Faucet: {} XRGE sent", faucet_amount)
     })))
+}
+
+// ===== NFT V2 Write Handlers =====
+
+async fn v2_nft_create_collection(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use quantum_vault_types::{TxPayload, TxV1};
+
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let p = &body.payload;
+    let symbol = p.get("symbol").and_then(|v| v.as_str()).unwrap_or_default();
+    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    let description = p.get("description").and_then(|v| v.as_str()).map(String::from);
+    let image = p.get("image").and_then(|v| v.as_str()).map(String::from);
+    let max_supply = p.get("maxSupply").and_then(|v| v.as_u64());
+    let royalty_bps = p.get("royaltyBps").and_then(|v| v.as_u64()).map(|v| v as u16);
+
+    let nft_fee = 50.0_f64;
+    let bal = state.node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < nft_fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": format!("insufficient XRGE balance for collection fee: have {:.4}, need {:.4}", bal, nft_fee)}))));
+    }
+
+    let tx = TxV1 {
+        version: 1,
+        tx_type: "nft_create_collection".to_string(),
+        from_pub_key: body.public_key.clone(),
+        nonce: chrono::Utc::now().timestamp_millis() as u64,
+        payload: TxPayload {
+            nft_collection_symbol: Some(symbol.to_string()),
+            nft_collection_name: Some(name.to_string()),
+            nft_description: description,
+            nft_image: image,
+            nft_max_supply: max_supply,
+            nft_royalty_bps: royalty_bps,
+            ..Default::default()
+        },
+        fee: nft_fee,
+        sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
+    };
+
+    let creator_short = if body.public_key.len() >= 16 { &body.public_key[..16] } else { &body.public_key };
+    let collection_id = format!("col:{}:{}", creator_short, symbol.to_uppercase());
+
+    state.node.add_tx_to_mempool(tx)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "collection_id": collection_id,
+        "message": "NFT collection creation submitted"
+    })))
+}
+
+async fn v2_nft_mint(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use quantum_vault_types::{TxPayload, TxV1};
+
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let p = &body.payload;
+    let collection_id = p.get("collectionId").and_then(|v| v.as_str()).unwrap_or_default();
+    let name = p.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+    let metadata_uri = p.get("metadataUri").and_then(|v| v.as_str()).map(String::from);
+    let attributes = p.get("attributes").cloned();
+
+    let mint_fee = 5.0_f64;
+    let bal = state.node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < mint_fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": format!("insufficient XRGE balance for mint fee: have {:.4}, need {:.4}", bal, mint_fee)}))));
+    }
+
+    // Only the collection creator can mint
+    if let Ok(Some(col)) = state.node.get_nft_collection(collection_id) {
+        if col.creator != body.public_key {
+            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "error": "only the collection creator can mint"}))));
+        }
+        if col.frozen {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "collection is frozen"}))));
+        }
+        if let Some(max) = col.max_supply {
+            if col.minted >= max {
+                return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "collection has reached max supply"}))));
+            }
+        }
+    } else {
+        return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"success": false, "error": "collection not found"}))));
+    }
+
+    let tx = TxV1 {
+        version: 1,
+        tx_type: "nft_mint".to_string(),
+        from_pub_key: body.public_key.clone(),
+        nonce: chrono::Utc::now().timestamp_millis() as u64,
+        payload: TxPayload {
+            nft_collection_id: Some(collection_id.to_string()),
+            nft_token_name: Some(name.to_string()),
+            nft_metadata_uri: metadata_uri,
+            nft_attributes: attributes,
+            ..Default::default()
+        },
+        fee: mint_fee,
+        sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
+    };
+
+    state.node.add_tx_to_mempool(tx)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "NFT mint submitted"
+    })))
+}
+
+async fn v2_nft_batch_mint(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use quantum_vault_types::{TxPayload, TxV1};
+
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let p = &body.payload;
+    let collection_id = p.get("collectionId").and_then(|v| v.as_str()).unwrap_or_default();
+    let names: Vec<String> = p.get("names")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
+    if names.is_empty() || names.len() > 50 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "batch mint requires 1-50 names"}))));
+    }
+
+    let fee = 5.0 * names.len() as f64;
+    let bal = state.node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": format!("insufficient XRGE balance for batch mint fee: have {:.4}, need {:.4}", bal, fee)}))));
+    }
+
+    // Only the collection creator can mint
+    if let Ok(Some(col)) = state.node.get_nft_collection(collection_id) {
+        if col.creator != body.public_key {
+            return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "error": "only the collection creator can mint"}))));
+        }
+        if col.frozen {
+            return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "collection is frozen"}))));
+        }
+        if let Some(max) = col.max_supply {
+            if col.minted + names.len() as u64 > max {
+                return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": format!("batch would exceed max supply ({} + {} > {})", col.minted, names.len(), max)}))));
+            }
+        }
+    } else {
+        return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"success": false, "error": "collection not found"}))));
+    }
+
+    let uris: Option<Vec<String>> = p.get("uris")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+    let attributes: Option<Vec<serde_json::Value>> = p.get("attributes")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.to_vec());
+
+    let tx = TxV1 {
+        version: 1,
+        tx_type: "nft_batch_mint".to_string(),
+        from_pub_key: body.public_key.clone(),
+        nonce: chrono::Utc::now().timestamp_millis() as u64,
+        payload: TxPayload {
+            nft_collection_id: Some(collection_id.to_string()),
+            nft_batch_names: Some(names),
+            nft_batch_uris: uris,
+            nft_batch_attributes: attributes,
+            ..Default::default()
+        },
+        fee,
+        sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
+    };
+
+    state.node.add_tx_to_mempool(tx)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "NFT batch mint submitted"
+    })))
+}
+
+async fn v2_nft_transfer(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use quantum_vault_types::{TxPayload, TxV1};
+
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let p = &body.payload;
+    let collection_id = p.get("collectionId").and_then(|v| v.as_str()).unwrap_or_default();
+    let token_id = p.get("tokenId").and_then(|v| v.as_u64()).unwrap_or(0);
+    let to = p.get("to").and_then(|v| v.as_str()).unwrap_or_default();
+    let sale_price = p.get("salePrice").and_then(|v| v.as_u64());
+
+    let transfer_fee = 1.0_f64;
+
+    // Calculate total XRGE needed (fee + royalty if sale)
+    let mut xrge_needed = transfer_fee;
+    if let Some(sp) = sale_price {
+        if sp > 0 {
+            if let Ok(Some(col)) = state.node.get_nft_collection(collection_id) {
+                if col.royalty_bps > 0 {
+                    xrge_needed += (sp as f64 * col.royalty_bps as f64) / 10000.0;
+                }
+            }
+        }
+    }
+
+    let bal = state.node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < xrge_needed {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": format!("insufficient XRGE balance: have {:.4}, need {:.4} (fee + royalty)", bal, xrge_needed)}))));
+    }
+
+    // Ownership and lock check
+    match state.node.get_nft_token(collection_id, token_id) {
+        Ok(Some(token)) => {
+            if token.owner != body.public_key {
+                return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "error": "you do not own this NFT"}))));
+            }
+            if token.locked {
+                return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "NFT is locked"}))));
+            }
+        }
+        _ => {
+            return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"success": false, "error": "NFT not found"}))));
+        }
+    }
+
+    let tx = TxV1 {
+        version: 1,
+        tx_type: "nft_transfer".to_string(),
+        from_pub_key: body.public_key.clone(),
+        nonce: chrono::Utc::now().timestamp_millis() as u64,
+        payload: TxPayload {
+            nft_collection_id: Some(collection_id.to_string()),
+            nft_token_id: Some(token_id),
+            to_pub_key_hex: Some(to.to_string()),
+            amount: sale_price,
+            ..Default::default()
+        },
+        fee: transfer_fee,
+        sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
+    };
+
+    state.node.add_tx_to_mempool(tx)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "NFT transfer submitted"
+    })))
+}
+
+async fn v2_nft_burn(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use quantum_vault_types::{TxPayload, TxV1};
+
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let p = &body.payload;
+    let collection_id = p.get("collectionId").and_then(|v| v.as_str()).unwrap_or_default();
+    let token_id = p.get("tokenId").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    let burn_fee = 0.1_f64;
+    let bal = state.node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < burn_fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": format!("insufficient XRGE balance for burn fee: have {:.4}, need {:.4}", bal, burn_fee)}))));
+    }
+
+    // Ownership check
+    match state.node.get_nft_token(collection_id, token_id) {
+        Ok(Some(token)) => {
+            if token.owner != body.public_key {
+                return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "error": "you do not own this NFT"}))));
+            }
+        }
+        _ => {
+            return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"success": false, "error": "NFT not found"}))));
+        }
+    }
+
+    let tx = TxV1 {
+        version: 1,
+        tx_type: "nft_burn".to_string(),
+        from_pub_key: body.public_key.clone(),
+        nonce: chrono::Utc::now().timestamp_millis() as u64,
+        payload: TxPayload {
+            nft_collection_id: Some(collection_id.to_string()),
+            nft_token_id: Some(token_id),
+            ..Default::default()
+        },
+        fee: 0.1,
+        sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
+    };
+
+    state.node.add_tx_to_mempool(tx)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "NFT burn submitted"
+    })))
+}
+
+async fn v2_nft_lock(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use quantum_vault_types::{TxPayload, TxV1};
+
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let p = &body.payload;
+    let collection_id = p.get("collectionId").and_then(|v| v.as_str()).unwrap_or_default();
+    let token_id = p.get("tokenId").and_then(|v| v.as_u64()).unwrap_or(0);
+    let locked = p.get("locked").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let lock_fee = 0.1_f64;
+    let bal = state.node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < lock_fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": format!("insufficient XRGE for lock fee: have {:.4}, need {:.4}", bal, lock_fee)}))));
+    }
+
+    // Ownership check
+    match state.node.get_nft_token(collection_id, token_id) {
+        Ok(Some(token)) => {
+            if token.owner != body.public_key {
+                return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "error": "you do not own this NFT"}))));
+            }
+        }
+        _ => {
+            return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"success": false, "error": "NFT not found"}))));
+        }
+    }
+
+    let tx = TxV1 {
+        version: 1,
+        tx_type: "nft_lock".to_string(),
+        from_pub_key: body.public_key.clone(),
+        nonce: chrono::Utc::now().timestamp_millis() as u64,
+        payload: TxPayload {
+            nft_collection_id: Some(collection_id.to_string()),
+            nft_token_id: Some(token_id),
+            nft_locked: Some(locked),
+            ..Default::default()
+        },
+        fee: 0.1,
+        sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
+    };
+
+    state.node.add_tx_to_mempool(tx)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "NFT lock toggled"
+    })))
+}
+
+async fn v2_nft_freeze_collection(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use quantum_vault_types::{TxPayload, TxV1};
+
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let p = &body.payload;
+    let collection_id = p.get("collectionId").and_then(|v| v.as_str()).unwrap_or_default();
+    let frozen = p.get("frozen").and_then(|v| v.as_bool()).unwrap_or(true);
+
+    let freeze_fee = 0.1_f64;
+    let bal = state.node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < freeze_fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": format!("insufficient XRGE for freeze fee: have {:.4}, need {:.4}", bal, freeze_fee)}))));
+    }
+
+    // Only the collection creator can freeze
+    match state.node.get_nft_collection(collection_id) {
+        Ok(Some(col)) => {
+            if col.creator != body.public_key {
+                return Err((StatusCode::FORBIDDEN, Json(serde_json::json!({"success": false, "error": "only the collection creator can freeze/unfreeze"}))));
+            }
+        }
+        _ => {
+            return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"success": false, "error": "collection not found"}))));
+        }
+    }
+
+    let tx = TxV1 {
+        version: 1,
+        tx_type: "nft_freeze_collection".to_string(),
+        from_pub_key: body.public_key.clone(),
+        nonce: chrono::Utc::now().timestamp_millis() as u64,
+        payload: TxPayload {
+            nft_collection_id: Some(collection_id.to_string()),
+            nft_frozen: Some(frozen),
+            ..Default::default()
+        },
+        fee: 0.1,
+        sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
+    };
+
+    state.node.add_tx_to_mempool(tx)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Collection freeze toggled"
+    })))
+}
+
+// ===== NFT Read-Only Query Handlers =====
+
+async fn nft_list_collections(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let collections = state.node.list_nft_collections()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
+    Ok(Json(serde_json::json!({ "collections": collections })))
+}
+
+async fn nft_get_collection(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let col = state.node.get_nft_collection(&id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
+    match col {
+        Some(c) => Ok(Json(serde_json::json!(c))),
+        None => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Collection not found"})))),
+    }
+}
+
+#[derive(Deserialize)]
+struct NftTokensQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+async fn nft_get_collection_tokens(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<NftTokensQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let limit = q.limit.unwrap_or(50).min(200);
+    let offset = q.offset.unwrap_or(0);
+    let (tokens, total) = state.node.get_nft_tokens_by_collection(&id, limit, offset)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
+    Ok(Json(serde_json::json!({ "tokens": tokens, "total": total, "limit": limit, "offset": offset })))
+}
+
+async fn nft_get_token(
+    State(state): State<AppState>,
+    Path((collection_id, token_id)): Path<(String, u64)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let token = state.node.get_nft_token(&collection_id, token_id)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
+    match token {
+        Some(t) => Ok(Json(serde_json::json!(t))),
+        None => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "NFT not found"})))),
+    }
+}
+
+async fn nft_get_owner_nfts(
+    State(state): State<AppState>,
+    Path(pubkey): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let nfts = state.node.get_nfts_by_owner(&pubkey)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
+    Ok(Json(serde_json::json!({ "nfts": nfts })))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeConfigResponse {
+    enabled: bool,
+    custody_address: Option<String>,
+    chain_id: u64,
+    supported_tokens: Vec<String>,
+}
+
+/// Parse ERC-20 Transfer event amount from a transaction receipt.
+/// ERC-20 Transfer topic: 0xddf252ad...
+/// Returns the amount in the token's smallest units.
+async fn parse_erc20_transfer_amount(
+    client: &reqwest::Client,
+    rpc_url: &str,
+    tx_hash: &str,
+) -> Result<u64, String> {
+    let resp = client
+        .post(rpc_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getTransactionReceipt",
+            "params": [tx_hash],
+            "id": 1,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+    let result = json.get("result").ok_or("No receipt")?;
+    let logs = result.get("logs").and_then(|v| v.as_array()).ok_or("No logs")?;
+
+    let transfer_topic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+    for log in logs {
+        let topics = log.get("topics").and_then(|v| v.as_array());
+        if let Some(topics) = topics {
+            if topics.len() >= 3 {
+                let topic0 = topics[0].as_str().unwrap_or("");
+                if topic0 == transfer_topic {
+                    let data = log.get("data").and_then(|v| v.as_str()).unwrap_or("0x0");
+                    let amount = u128::from_str_radix(
+                        data.trim_start_matches("0x"),
+                        16,
+                    ).unwrap_or(0);
+                    // USDC has 6 decimals; we store qUSDC in the same 6-decimal units
+                    return Ok(amount as u64);
+                }
+            }
+        }
+    }
+    Err("No Transfer event found".to_string())
+}
+
+async fn bridge_config(State(state): State<AppState>) -> Json<BridgeConfigResponse> {
+    let (enabled, custody_address) = match &state.bridge_custody_address {
+        Some(addr) if !addr.is_empty() => (true, Some(addr.clone())),
+        _ => (false, None),
+    };
+    Json(BridgeConfigResponse {
+        enabled,
+        custody_address,
+        chain_id: 84532,
+        supported_tokens: vec!["ETH".to_string(), "USDC".to_string()],
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeClaimRequest {
+    evm_tx_hash: String,
+    evm_address: String,
+    evm_signature: String,
+    recipient_rougechain_pubkey: String,
+    token: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeClaimResponse {
+    success: bool,
+    tx_id: Option<String>,
+    error: Option<String>,
+}
+
+async fn bridge_claim(
+    State(state): State<AppState>,
+    Json(body): Json<BridgeClaimRequest>,
+) -> Result<Json<BridgeClaimResponse>, (StatusCode, Json<BridgeClaimResponse>)> {
+    let custody = match &state.bridge_custody_address {
+        Some(addr) if !addr.is_empty() => addr.clone(),
+        _ => {
+            return Ok(Json(BridgeClaimResponse {
+                success: false,
+                tx_id: None,
+                error: Some("Bridge is not enabled (QV_BRIDGE_CUSTODY_ADDRESS not set)".to_string()),
+            }));
+        }
+    };
+    let tx_hash = body.evm_tx_hash.trim_start_matches("0x").to_lowercase();
+    let tx_hash_hex = format!("0x{}", tx_hash);
+    let evm_from = body.evm_address.trim().to_lowercase();
+    let evm_from = if !evm_from.starts_with("0x") {
+        format!("0x{}", evm_from)
+    } else {
+        evm_from
+    };
+    let recipient = normalize_recipient(&body.recipient_rougechain_pubkey);
+    let custody_lower = custody.trim().to_lowercase();
+    let custody = if !custody_lower.starts_with("0x") {
+        format!("0x{}", custody_lower)
+    } else {
+        custody_lower
+    };
+    let evm_signature = body.evm_signature.trim();
+    if evm_signature.is_empty() {
+        return Ok(Json(BridgeClaimResponse {
+            success: false,
+            tx_id: None,
+            error: Some("EVM signature required - sign the claim message with the wallet that sent the ETH".to_string()),
+        }));
+    }
+
+    if state.bridge_claim_store.contains(&tx_hash_hex).await {
+        return Ok(Json(BridgeClaimResponse {
+            success: false,
+            tx_id: None,
+            error: Some("Transaction already claimed".to_string()),
+        }));
+    }
+
+    let rpc_url = state.base_sepolia_rpc.clone();
+    let client = reqwest::Client::new();
+    const BASE_SEPOLIA_CHAIN_ID: u64 = 84532;
+    const MIN_CONFIRMATIONS: u64 = 1;
+    let chain_resp = client.post(&rpc_url).json(&serde_json::json!({"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1})).send().await;
+    if let Ok(r) = chain_resp {
+        if let Ok(json) = r.json::<serde_json::Value>().await {
+            if let Some(hex) = json.get("result").and_then(|v| v.as_str()) {
+                let id = u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or(0);
+                if id != BASE_SEPOLIA_CHAIN_ID {
+                    return Ok(Json(BridgeClaimResponse {
+                        success: false, tx_id: None,
+                        error: Some(format!("Wrong chain: expected Base Sepolia ({}), got {}", BASE_SEPOLIA_CHAIN_ID, id)),
+                    }));
+                }
+            }
+        }
+    }
+    let resp = client
+        .post(&rpc_url)
+        .json(&serde_json::json!({"jsonrpc":"2.0","method":"eth_getTransactionByHash","params":[tx_hash_hex],"id":1}))
+        .send()
+        .await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(e) => {
+            return Ok(Json(BridgeClaimResponse {
+                success: false,
+                tx_id: None,
+                error: Some(format!("Failed to fetch transaction: {}", e)),
+            }));
+        }
+    };
+    let json: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            return Ok(Json(BridgeClaimResponse {
+                success: false,
+                tx_id: None,
+                error: Some(format!("Invalid RPC response: {}", e)),
+            }));
+        }
+    };
+    let result = json.get("result");
+    let tx = match result {
+        Some(serde_json::Value::Null) => {
+            return Ok(Json(BridgeClaimResponse {
+                success: false,
+                tx_id: None,
+                error: Some("Transaction not found or not yet mined".to_string()),
+            }));
+        }
+        Some(obj) => obj,
+        None => {
+            return Ok(Json(BridgeClaimResponse {
+                success: false,
+                tx_id: None,
+                error: Some(json.get("error").and_then(|e| e.get("message")).and_then(|m| m.as_str()).unwrap_or("RPC error").to_string()),
+            }));
+        }
+    };
+    let tx_to = tx.get("to").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    let tx_from = tx.get("from").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+    let tx_value = tx.get("value").and_then(|v| v.as_str()).unwrap_or("0x0");
+    let value_wei = u128::from_str_radix(tx_value.trim_start_matches("0x"), 16).unwrap_or(0);
+    if tx_to != custody {
+        return Ok(Json(BridgeClaimResponse {
+            success: false,
+            tx_id: None,
+            error: Some(format!("Transaction recipient mismatch: expected {}, got {}", custody, tx_to)),
+        }));
+    }
+    if tx_from != evm_from {
+        return Ok(Json(BridgeClaimResponse {
+            success: false,
+            tx_id: None,
+            error: Some(format!("Transaction sender mismatch: expected {}, got {}", evm_from, tx_from)),
+        }));
+    }
+    // Verify EVM signature: signer must be tx_from (deposit sender). Message format must match frontend.
+    let claim_message = format!("RougeChain bridge claim\nTx: {}\nRecipient: {}", tx_hash_hex, recipient);
+    let sig_bytes = hex::decode(evm_signature.trim_start_matches("0x")).unwrap_or_default();
+    let sig_valid = eth_ecdsa_verifier::validate_ecdsa_signature(
+        &evm_from,
+        claim_message.as_bytes(),
+        &sig_bytes,
+    );
+    if !sig_valid.unwrap_or(false) {
+        return Ok(Json(BridgeClaimResponse {
+            success: false,
+            tx_id: None,
+            error: Some("Invalid signature - sign the claim message with the wallet that sent the ETH".to_string()),
+        }));
+    }
+    if value_wei == 0 {
+        return Ok(Json(BridgeClaimResponse {
+            success: false,
+            tx_id: None,
+            error: Some("Transaction has zero value".to_string()),
+        }));
+    }
+    let block_hex = tx.get("blockNumber").and_then(|v| v.as_str()).unwrap_or("");
+    if block_hex.is_empty() || block_hex == "null" {
+        return Ok(Json(BridgeClaimResponse {
+            success: false,
+            tx_id: None,
+            error: Some("Transaction not yet mined".to_string()),
+        }));
+    }
+    let tx_block = u64::from_str_radix(block_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+    let latest_resp = client
+        .post(&rpc_url)
+        .json(&serde_json::json!({"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}))
+        .send()
+        .await;
+    if let Ok(r) = latest_resp {
+        if let Ok(j) = r.json::<serde_json::Value>().await {
+            if let Some(hex) = j.get("result").and_then(|v| v.as_str()) {
+                let latest = u64::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or(0);
+                if latest < tx_block + MIN_CONFIRMATIONS {
+                    return Ok(Json(BridgeClaimResponse {
+                        success: false, tx_id: None,
+                        error: Some(format!("Need {} confirmations (tx block {}, latest {})", MIN_CONFIRMATIONS, tx_block, latest)),
+                    }));
+                }
+            }
+        }
+    }
+    let bridge_token = body.token.as_deref().unwrap_or("ETH").to_uppercase();
+
+    let (amount_units, mint_symbol) = match bridge_token.as_str() {
+        "USDC" => {
+            // USDC has 6 decimals on EVM. We check the tx receipt for ERC-20 transfer logs.
+            // For USDC, value_wei from the ETH tx will be 0 (it's an ERC-20 transfer).
+            // We need to parse the transfer amount from the logs.
+            let usdc_amount = parse_erc20_transfer_amount(
+                &client, &rpc_url, &tx_hash_hex
+            ).await.unwrap_or(0);
+            if usdc_amount == 0 {
+                return Ok(Json(BridgeClaimResponse {
+                    success: false, tx_id: None,
+                    error: Some("No USDC transfer found in transaction".to_string()),
+                }));
+            }
+            (usdc_amount, "qUSDC")
+        }
+        _ => {
+            let units = (value_wei / 1_000_000_000_000) as u64;
+            if units == 0 {
+                return Ok(Json(BridgeClaimResponse {
+                    success: false, tx_id: None,
+                    error: Some("Amount too small (min 0.000001 ETH)".to_string()),
+                }));
+            }
+            (units, "qETH")
+        }
+    };
+
+    if let Err(e) = state.bridge_claim_store.insert(tx_hash_hex.clone()).await {
+        return Ok(Json(BridgeClaimResponse {
+            success: false,
+            tx_id: None,
+            error: Some(format!("Failed to persist claim: {}", e)),
+        }));
+    }
+
+    use quantum_vault_crypto::{bytes_to_hex, sha256};
+    use quantum_vault_types::encode_tx_v1;
+    match state.node.submit_bridge_mint_tx(&recipient, amount_units, mint_symbol) {
+        Ok(tx) => {
+            let id = bytes_to_hex(&sha256(&encode_tx_v1(&tx)));
+            Ok(Json(BridgeClaimResponse {
+                success: true,
+                tx_id: Some(id),
+                error: None,
+            }))
+        }
+        Err(e) => Ok(Json(BridgeClaimResponse {
+            success: false,
+            tx_id: None,
+            error: Some(e),
+        })),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeWithdrawRequest {
+    #[serde(default)]
+    from_private_key: Option<String>,
+    from_public_key: String,
+    amount_units: u64,
+    evm_address: String,
+    fee: Option<f64>,
+    signature: Option<String>,
+    payload: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeWithdrawResponse {
+    success: bool,
+    tx_id: Option<String>,
+    error: Option<String>,
+}
+
+async fn bridge_withdraw(
+    State(state): State<AppState>,
+    Json(body): Json<BridgeWithdrawRequest>,
+) -> Result<Json<BridgeWithdrawResponse>, (StatusCode, Json<BridgeWithdrawResponse>)> {
+    if state.bridge_custody_address.is_none() || state.bridge_custody_address.as_ref().map(|s| s.is_empty()).unwrap_or(true) {
+        return Ok(Json(BridgeWithdrawResponse {
+            success: false,
+            tx_id: None,
+            error: Some("Bridge is not enabled (QV_BRIDGE_CUSTODY_ADDRESS not set)".to_string()),
+        }));
+    }
+    if body.amount_units == 0 {
+        return Ok(Json(BridgeWithdrawResponse {
+            success: false,
+            tx_id: None,
+            error: Some("Amount must be greater than 0".to_string()),
+        }));
+    }
+
+    let token_symbol = body.payload.as_ref()
+        .and_then(|p| p.get("tokenSymbol"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("qETH")
+        .to_string();
+
+    // Prefer signed payload (client-side signing) over raw private key
+    let tx_result = if let (Some(signature), Some(payload)) = (&body.signature, &body.payload) {
+        let signed_req = SignedTransactionRequest {
+            payload: payload.clone(),
+            signature: signature.clone(),
+            public_key: body.from_public_key.clone(),
+        };
+        if let Err(e) = verify_signed_tx(&signed_req) {
+            return Ok(Json(BridgeWithdrawResponse {
+                success: false,
+                tx_id: None,
+                error: Some(format!("Signature verification failed: {}", e)),
+            }));
+        }
+        state.node.submit_bridge_withdraw_tx_signed(
+            &body.from_public_key,
+            body.amount_units,
+            &body.evm_address,
+            body.fee,
+            &token_symbol,
+        )
+    } else if let Some(ref private_key) = body.from_private_key {
+        state.node.submit_bridge_withdraw_tx(
+            private_key,
+            &body.from_public_key,
+            body.amount_units,
+            &body.evm_address,
+            body.fee,
+        )
+    } else {
+        return Ok(Json(BridgeWithdrawResponse {
+            success: false,
+            tx_id: None,
+            error: Some("Either signature+payload or fromPrivateKey is required".to_string()),
+        }));
+    };
+
+    match tx_result {
+        Ok(tx) => {
+            let id = quantum_vault_crypto::bytes_to_hex(&quantum_vault_crypto::sha256(&quantum_vault_types::encode_tx_v1(&tx)));
+            state.ws_broadcaster.broadcast_new_tx(
+                &id,
+                &tx.tx_type,
+                &tx.from_pub_key,
+                tx.payload.evm_address.as_deref(),
+                tx.payload.amount,
+            );
+            let peers = state.peer_manager.get_peers().await;
+            if !peers.is_empty() {
+                peer::broadcast_tx(&peers, &tx);
+            }
+            Ok(Json(BridgeWithdrawResponse {
+                success: true,
+                tx_id: Some(id),
+                error: None,
+            }))
+        }
+        Err(e) => Ok(Json(BridgeWithdrawResponse {
+            success: false,
+            tx_id: None,
+            error: Some(e),
+        })),
+    }
+}
+
+#[derive(Serialize)]
+struct BridgeWithdrawalsResponse {
+    withdrawals: Vec<BridgeWithdrawalItem>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeWithdrawalItem {
+    tx_id: String,
+    evm_address: String,
+    amount_units: u64,
+    created_at: i64,
+}
+
+async fn bridge_withdrawals(State(state): State<AppState>) -> Json<BridgeWithdrawalsResponse> {
+    let list = state.bridge_withdraw_store.list().unwrap_or_default();
+    Json(BridgeWithdrawalsResponse {
+        withdrawals: list
+            .into_iter()
+            .map(|w| BridgeWithdrawalItem {
+                tx_id: w.tx_id,
+                evm_address: w.evm_address,
+                amount_units: w.amount_units,
+                created_at: w.created_at,
+            })
+            .collect(),
+    })
+}
+
+#[derive(Serialize)]
+struct BridgeFulfillResponse {
+    success: bool,
+    error: Option<String>,
+}
+
+async fn bridge_withdrawal_fulfill(
+    State(state): State<AppState>,
+    Path(tx_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Json<BridgeFulfillResponse> {
+    let relayer_auth = if let Some(ref secret) = state.bridge_relayer_secret {
+        headers.get("x-bridge-relayer-secret")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == secret.as_str())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if !relayer_auth {
+        let parsed: Result<SignedTransactionRequest, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(signed_body) => {
+                let node_pub_key = state.node.get_node_public_key();
+                if signed_body.public_key != node_pub_key {
+                    return Json(BridgeFulfillResponse {
+                        success: false,
+                        error: Some("unauthorized: only the node operator can fulfill withdrawals".to_string()),
+                    });
+                }
+                if let Err(e) = verify_signed_tx(&signed_body) {
+                    return Json(BridgeFulfillResponse {
+                        success: false,
+                        error: Some(format!("signature verification failed: {}", e)),
+                    });
+                }
+            }
+            Err(_) => {
+                return Json(BridgeFulfillResponse {
+                    success: false,
+                    error: Some("unauthorized: provide x-bridge-relayer-secret header or signed body".to_string()),
+                });
+            }
+        }
+    }
+
+    match state.bridge_withdraw_store.remove(&tx_id) {
+        Ok(true) => Json(BridgeFulfillResponse {
+            success: true,
+            error: None,
+        }),
+        Ok(false) => Json(BridgeFulfillResponse {
+            success: false,
+            error: Some("Withdrawal not found or already fulfilled".to_string()),
+        }),
+        Err(e) => Json(BridgeFulfillResponse {
+            success: false,
+            error: Some(e),
+        }),
+    }
+}
+
+// ============================================
+// XRGE Bridge endpoints (Base <-> RougeChain L1)
+// ============================================
+
+async fn xrge_bridge_config(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let enabled = state.xrge_bridge_vault.is_some();
+    Json(serde_json::json!({
+        "enabled": enabled,
+        "vaultAddress": state.xrge_bridge_vault,
+        "tokenAddress": state.xrge_bridge_token,
+        "chainId": 84532,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct XrgeBridgeClaimRequest {
+    evm_tx_hash: String,
+    evm_address: String,
+    evm_signature: Option<String>,
+    amount: String,
+    recipient_rougechain_pubkey: String,
+}
+
+async fn xrge_bridge_claim(
+    State(state): State<AppState>,
+    Json(body): Json<XrgeBridgeClaimRequest>,
+) -> Json<serde_json::Value> {
+    if state.xrge_bridge_vault.is_none() {
+        return Json(serde_json::json!({ "success": false, "error": "XRGE bridge not enabled" }));
+    }
+    let tx_hash = body.evm_tx_hash.trim_start_matches("0x").to_lowercase();
+    let tx_hash_hex = format!("0x{}", tx_hash);
+    let prefixed_hash = format!("xrge:{}", tx_hash_hex);
+
+    if state.bridge_claim_store.contains(&prefixed_hash).await {
+        return Json(serde_json::json!({ "success": false, "error": "Transaction already claimed" }));
+    }
+
+    let amount_raw: f64 = body.amount.parse().unwrap_or(0.0);
+    let amount_l1 = (amount_raw / 1e18).round() as u64;
+    if amount_l1 == 0 {
+        return Json(serde_json::json!({ "success": false, "error": "Amount too small" }));
+    }
+
+    let recipient = normalize_recipient(&body.recipient_rougechain_pubkey);
+
+    let client = reqwest::Client::new();
+    let rpc_url = &state.base_sepolia_rpc;
+    let resp = client
+        .post(rpc_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_getTransactionReceipt",
+            "params": [tx_hash_hex],
+            "id": 1,
+        }))
+        .send()
+        .await;
+
+    let receipt_ok = match resp {
+        Ok(r) => match r.json::<serde_json::Value>().await {
+            Ok(j) => {
+                let result = j.get("result");
+                match result {
+                    Some(serde_json::Value::Null) | None => false,
+                    Some(obj) => {
+                        let status = obj.get("status").and_then(|v| v.as_str()).unwrap_or("0x0");
+                        status == "0x1"
+                    }
+                }
+            }
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+
+    if !receipt_ok {
+        return Json(serde_json::json!({ "success": false, "error": "Transaction not confirmed or failed" }));
+    }
+
+    // Verify EVM signature if provided (optional for backward compat, will be required in future)
+    let evm_sig = body.evm_signature.as_deref().unwrap_or("").trim().to_string();
+    if !evm_sig.is_empty() {
+        let claim_message = format!("RougeChain XRGE bridge claim\nTx: {}\nRecipient: {}", tx_hash_hex, recipient);
+        let sig_bytes = hex::decode(evm_sig.trim_start_matches("0x")).unwrap_or_default();
+        let evm_addr = body.evm_address.trim().to_lowercase();
+        let sig_valid = eth_ecdsa_verifier::validate_ecdsa_signature(
+            &evm_addr,
+            claim_message.as_bytes(),
+            &sig_bytes,
+        );
+        if !sig_valid.unwrap_or(false) {
+            return Json(serde_json::json!({ "success": false, "error": "Invalid EVM signature — sign the claim message with the wallet that sent the XRGE" }));
+        }
+    } else {
+        eprintln!("[bridge] Warning: XRGE claim without EVM signature for tx {} — will be required in future", tx_hash_hex);
+    }
+
+    if let Err(e) = state.bridge_claim_store.insert(prefixed_hash).await {
+        return Json(serde_json::json!({ "success": false, "error": format!("Failed to persist claim: {}", e) }));
+    }
+
+    use quantum_vault_crypto::{bytes_to_hex, sha256};
+    use quantum_vault_types::encode_tx_v1;
+    match state.node.submit_bridge_mint_tx(&recipient, amount_l1, "XRGE") {
+        Ok(tx) => {
+            let id = bytes_to_hex(&sha256(&encode_tx_v1(&tx)));
+            Json(serde_json::json!({ "success": true, "txId": id }))
+        }
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct XrgeBridgeWithdrawRequest {
+    from_public_key: String,
+    amount: u64,
+    evm_address: String,
+    signature: Option<String>,
+    payload: Option<serde_json::Value>,
+    #[serde(default)]
+    from_private_key: Option<String>,
+}
+
+async fn xrge_bridge_withdraw(
+    State(state): State<AppState>,
+    Json(body): Json<XrgeBridgeWithdrawRequest>,
+) -> Json<serde_json::Value> {
+    if state.xrge_bridge_vault.is_none() {
+        return Json(serde_json::json!({ "success": false, "error": "XRGE bridge not enabled" }));
+    }
+    if body.amount == 0 {
+        return Json(serde_json::json!({ "success": false, "error": "Amount must be greater than 0" }));
+    }
+
+    let tx_result = if let (Some(signature), Some(payload)) = (&body.signature, &body.payload) {
+        let signed_req = SignedTransactionRequest {
+            payload: payload.clone(),
+            signature: signature.clone(),
+            public_key: body.from_public_key.clone(),
+        };
+        if let Err(e) = verify_signed_tx(&signed_req) {
+            return Json(serde_json::json!({ "success": false, "error": format!("Signature verification failed: {}", e) }));
+        }
+        state.node.submit_bridge_withdraw_tx_signed(
+            &body.from_public_key,
+            body.amount,
+            &body.evm_address,
+            Some(0.1),
+            "XRGE",
+        )
+    } else if let Some(ref private_key) = body.from_private_key {
+        state.node.submit_bridge_withdraw_tx(
+            private_key,
+            &body.from_public_key,
+            body.amount,
+            &body.evm_address,
+            Some(0.1),
+        )
+    } else {
+        return Json(serde_json::json!({ "success": false, "error": "Either signature+payload or fromPrivateKey is required" }));
+    };
+
+    match tx_result {
+        Ok(tx) => {
+            let id = quantum_vault_crypto::bytes_to_hex(
+                &quantum_vault_crypto::sha256(&quantum_vault_types::encode_tx_v1(&tx)),
+            );
+            state.ws_broadcaster.broadcast_new_tx(
+                &id, &tx.tx_type, &tx.from_pub_key,
+                tx.payload.evm_address.as_deref(), tx.payload.amount,
+            );
+            let peers = state.peer_manager.get_peers().await;
+            if !peers.is_empty() { peer::broadcast_tx(&peers, &tx); }
+            Json(serde_json::json!({ "success": true, "txId": id }))
+        }
+        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+    }
+}
+
+async fn xrge_bridge_withdrawals(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let list = state.bridge_withdraw_store.list().unwrap_or_default();
+    let xrge_withdrawals: Vec<_> = list.into_iter()
+        .filter(|w| w.tx_id.starts_with("xrge:") || {
+            // TODO: once we tag token_symbol in PendingWithdrawal, filter properly
+            false
+        })
+        .map(|w| serde_json::json!({
+            "tx_id": w.tx_id,
+            "evm_address": w.evm_address,
+            "amount": w.amount_units,
+            "created_at": w.created_at,
+        }))
+        .collect();
+    Json(serde_json::json!({ "withdrawals": xrge_withdrawals }))
+}
+
+async fn xrge_bridge_fulfill(
+    State(state): State<AppState>,
+    Path(tx_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Json<BridgeFulfillResponse> {
+    let relayer_auth = if let Some(ref secret) = state.bridge_relayer_secret {
+        headers.get("x-bridge-relayer-secret")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == secret.as_str())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    if !relayer_auth {
+        let parsed: Result<SignedTransactionRequest, _> = serde_json::from_str(&body);
+        match parsed {
+            Ok(signed_body) => {
+                let node_pub_key = state.node.get_node_public_key();
+                if signed_body.public_key != node_pub_key {
+                    return Json(BridgeFulfillResponse {
+                        success: false,
+                        error: Some("unauthorized".to_string()),
+                    });
+                }
+                if let Err(e) = verify_signed_tx(&signed_body) {
+                    return Json(BridgeFulfillResponse {
+                        success: false,
+                        error: Some(format!("signature verification failed: {}", e)),
+                    });
+                }
+            }
+            Err(_) => {
+                return Json(BridgeFulfillResponse {
+                    success: false,
+                    error: Some("unauthorized: provide x-bridge-relayer-secret header or signed body".to_string()),
+                });
+            }
+        }
+    }
+
+    match state.bridge_withdraw_store.remove(&tx_id) {
+        Ok(true) => Json(BridgeFulfillResponse { success: true, error: None }),
+        Ok(false) => Json(BridgeFulfillResponse { success: false, error: Some("Withdrawal not found".to_string()) }),
+        Err(e) => Json(BridgeFulfillResponse { success: false, error: Some(e) }),
+    }
 }
 
 fn default_data_dir(node_name: &str) -> PathBuf {
@@ -2635,3 +4840,264 @@ fn default_data_dir(node_name: &str) -> PathBuf {
         .unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".quantum-vault").join(node_name)
 }
+
+// ============================================
+// Shielded Transaction Handlers (Phase 2)
+// ============================================
+
+/// Shield: Convert public XRGE balance into a shielded note commitment
+async fn v2_shield(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use quantum_vault_types::{TxPayload, TxV1};
+
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let node = &state.node;
+    let payload = &body.payload;
+
+    let amount = payload.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
+    let commitment = payload.get("commitment").and_then(|v| v.as_str()).unwrap_or_default();
+    let fee = 1.0_f64;
+
+    if amount == 0 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "amount must be greater than zero"}))));
+    }
+    if commitment.is_empty() || commitment.len() != 64 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "commitment must be a 64-char hex string (32 bytes)"}))));
+    }
+
+    // Balance check
+    let bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < amount as f64 + fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": format!("insufficient XRGE: have {:.4}, need {:.4}", bal, amount as f64 + fee)
+        }))));
+    }
+
+    let tx = TxV1 {
+        version: 1,
+        tx_type: "shield".to_string(),
+        from_pub_key: body.public_key.clone(),
+        nonce: chrono::Utc::now().timestamp_millis() as u64,
+        payload: TxPayload {
+            shielded_commitment: Some(commitment.to_string()),
+            shielded_value: Some(amount),
+            ..Default::default()
+        },
+        fee,
+        sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
+    };
+
+    node.add_tx_to_mempool(tx)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Shield transaction submitted",
+        "commitment": commitment
+    })))
+}
+
+/// Shielded Transfer: Private note-to-note transfer with STARK proof
+async fn v2_shielded_transfer(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use quantum_vault_types::{TxPayload, TxV1};
+
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let node = &state.node;
+    let payload = &body.payload;
+
+    let nullifiers: Vec<String> = payload.get("nullifiers")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let output_commitments: Vec<String> = payload.get("output_commitments")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let proof_hex = payload.get("proof").and_then(|v| v.as_str()).unwrap_or_default();
+    let shielded_fee = payload.get("fee").and_then(|v| v.as_u64()).unwrap_or(0);
+    let fee = 1.0_f64;
+
+    // Validate inputs
+    if nullifiers.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "at least one nullifier required"}))));
+    }
+    if output_commitments.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "at least one output commitment required"}))));
+    }
+    if proof_hex.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "STARK proof is required"}))));
+    }
+
+    // Check nullifiers aren't already spent
+    for nullifier in &nullifiers {
+        match node.is_nullifier_spent(nullifier) {
+            Ok(true) => {
+                return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("double-spend detected: nullifier {} already spent", &nullifier[..16.min(nullifier.len())])
+                }))));
+            }
+            Err(e) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"success": false, "error": e}))));
+            }
+            _ => {}
+        }
+    }
+
+    // Fee balance check
+    let bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": format!("insufficient XRGE for fee: have {:.4}, need {:.4}", bal, fee)
+        }))));
+    }
+
+    let tx = TxV1 {
+        version: 1,
+        tx_type: "shielded_transfer".to_string(),
+        from_pub_key: body.public_key.clone(),
+        nonce: chrono::Utc::now().timestamp_millis() as u64,
+        payload: TxPayload {
+            shielded_nullifiers: Some(nullifiers),
+            shielded_output_commitments: Some(output_commitments),
+            shielded_proof: Some(proof_hex.to_string()),
+            shielded_fee: Some(shielded_fee),
+            ..Default::default()
+        },
+        fee,
+        sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
+    };
+
+    node.add_tx_to_mempool(tx)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Shielded transfer submitted"
+    })))
+}
+
+/// Unshield: Convert a shielded note back to public XRGE balance
+async fn v2_unshield(
+    State(state): State<AppState>,
+    Json(body): Json<SignedTransactionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    use quantum_vault_types::{TxPayload, TxV1};
+
+    let signed_payload = verify_signed_tx(&body).map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    let node = &state.node;
+    let payload = &body.payload;
+
+    let nullifiers: Vec<String> = payload.get("nullifiers")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    let amount = payload.get("amount").and_then(|v| v.as_u64()).unwrap_or(0);
+    let proof_hex = payload.get("proof").and_then(|v| v.as_str()).unwrap_or_default();
+    let fee = 1.0_f64;
+
+    if nullifiers.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "nullifier required to unshield"}))));
+    }
+    if amount == 0 {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "amount must be greater than zero"}))));
+    }
+    if proof_hex.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": "STARK proof is required"}))));
+    }
+
+    // Check nullifiers aren't already spent
+    for nullifier in &nullifiers {
+        match node.is_nullifier_spent(nullifier) {
+            Ok(true) => {
+                return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("nullifier {} already spent", &nullifier[..16.min(nullifier.len())])
+                }))));
+            }
+            Err(e) => {
+                return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"success": false, "error": e}))));
+            }
+            _ => {}
+        }
+    }
+
+    // Fee balance check
+    let bal = node.get_balance(&body.public_key).unwrap_or(0.0);
+    if bal < fee {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "success": false,
+            "error": format!("insufficient XRGE for fee: have {:.4}, need {:.4}", bal, fee)
+        }))));
+    }
+
+    let tx = TxV1 {
+        version: 1,
+        tx_type: "unshield".to_string(),
+        from_pub_key: body.public_key.clone(),
+        nonce: chrono::Utc::now().timestamp_millis() as u64,
+        payload: TxPayload {
+            shielded_nullifiers: Some(nullifiers),
+            shielded_value: Some(amount),
+            shielded_proof: Some(proof_hex.to_string()),
+            ..Default::default()
+        },
+        fee,
+        sig: body.signature.clone(),
+        signed_payload: Some(signed_payload),
+    };
+
+    node.add_tx_to_mempool(tx)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"success": false, "error": e}))))?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "message": "Unshield transaction submitted",
+        "amount": amount
+    })))
+}
+
+/// Read-only: Get shielded pool statistics
+async fn shielded_stats(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let node = &state.node;
+    let commitment_count = node.get_commitment_count();
+    let nullifier_count = node.get_nullifier_count();
+
+    Json(serde_json::json!({
+        "success": true,
+        "commitment_count": commitment_count,
+        "nullifier_count": nullifier_count,
+        "active_notes": commitment_count.saturating_sub(nullifier_count)
+    }))
+}
+
+/// Read-only: Check if a nullifier has been spent
+async fn shielded_nullifier_check(
+    State(state): State<AppState>,
+    Path(hash): Path<String>,
+) -> Json<serde_json::Value> {
+    let node = &state.node;
+    match node.is_nullifier_spent(&hash) {
+        Ok(spent) => Json(serde_json::json!({
+            "success": true,
+            "nullifier": hash,
+            "spent": spent
+        })),
+        Err(e) => Json(serde_json::json!({
+            "success": false,
+            "error": e
+        })),
+    }
+}
+

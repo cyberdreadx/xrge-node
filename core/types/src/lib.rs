@@ -35,6 +35,56 @@ pub struct TxPayload {
     pub min_amount_out: Option<u64>,       // Minimum output (slippage protection)
     pub swap_path: Option<Vec<String>>,    // Multi-hop path [TOKENA, XRGE, TOKENB]
     pub lp_amount: Option<u64>,            // LP token amount for remove_liquidity
+    // Bridge withdraw: EVM address to receive ETH when burning qETH
+    pub evm_address: Option<String>,
+    // NFT fields
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_collection_symbol: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_collection_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_collection_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_max_supply: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_royalty_bps: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_token_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_token_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_metadata_uri: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_attributes: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_locked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_frozen: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_batch_names: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_batch_uris: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nft_batch_attributes: Option<Vec<serde_json::Value>>,
+    // Shielded transaction fields (Phase 2)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shielded_nullifiers: Option<Vec<String>>,         // Hex nullifiers of consumed notes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shielded_output_commitments: Option<Vec<String>>, // Hex output commitments
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shielded_proof: Option<String>,                   // Hex-encoded STARK proof
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shielded_fee: Option<u64>,                        // Fee (public)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shielded_commitment: Option<String>,              // Single commitment (for shield/unshield)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shielded_value: Option<u64>,                      // Value being shielded/unshielded
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shielded_randomness: Option<String>,              // Hex randomness (for unshield proof)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +96,8 @@ pub struct TxV1 {
     pub payload: TxPayload,
     pub fee: f64,
     pub sig: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_payload: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +146,28 @@ pub struct PQKeypair {
 
 pub fn encode_tx_v1(tx: &TxV1) -> Vec<u8> {
     serde_json::to_vec(tx).unwrap_or_default()
+}
+
+/// Encode everything except `sig` — this is the message that gets signed/verified.
+pub fn encode_tx_for_signing(tx: &TxV1) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct Signable<'a> {
+        version: u32,
+        tx_type: &'a str,
+        from_pub_key: &'a str,
+        nonce: u64,
+        payload: &'a TxPayload,
+        fee: f64,
+    }
+    let s = Signable {
+        version: tx.version,
+        tx_type: &tx.tx_type,
+        from_pub_key: &tx.from_pub_key,
+        nonce: tx.nonce,
+        payload: &tx.payload,
+        fee: tx.fee,
+    };
+    serde_json::to_vec(&s).unwrap_or_default()
 }
 
 pub fn encode_header_v1(header: &BlockHeaderV1) -> Vec<u8> {
