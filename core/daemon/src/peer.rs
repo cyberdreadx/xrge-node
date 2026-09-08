@@ -159,7 +159,13 @@ pub fn parse_peers(peers_str: &str) -> Vec<String> {
 /// Sync blocks from a peer (with genesis reset if needed)
 async fn sync_from_peer(peer_url: &str, node: &L1Node, allow_genesis_reset: bool) -> Result<u64, String> {
     // Fetch peer's blocks
-    let url = format!("{}/blocks?limit=1000", peer_url);
+    // For fresh nodes (no blocks), request from height 0 to get genesis
+    let our_height = node.get_tip_height().unwrap_or(0);
+    let url = if our_height == 0 {
+        format!("{}/blocks?from_height=0&limit=1000", peer_url)
+    } else {
+        format!("{}/blocks?limit=1000", peer_url)
+    };
     let response = reqwest::get(&url)
         .await
         .map_err(|e| format!("Failed to fetch from {}: {}", peer_url, e))?;
